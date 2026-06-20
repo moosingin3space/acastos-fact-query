@@ -1,0 +1,32 @@
+name: Fuzz
+
+# Manually triggered differential fuzzing of the ascent-jit engine. Runs the
+# in-tree arbtest suite (stable toolchain) at a configurable budget via the
+# Justfile's `fuzz-quick` recipe.
+on:
+  workflow_dispatch:
+    inputs:
+      budget_ms:
+        description: "Per-property fuzz budget in milliseconds"
+        required: false
+        default: "30000"
+
+jobs:
+  fuzz:
+    name: differential fuzz (arbtest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: extractions/setup-just@v2
+
+      # The Justfile is the source of truth for how fuzzing runs.
+      - name: Run differential fuzzing
+        run: just fuzz-quick ${{ inputs.budget_ms }}

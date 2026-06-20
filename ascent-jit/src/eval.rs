@@ -315,9 +315,9 @@ fn check_atom_arity(program: &Program, atom: &Atom) -> Result<(), EvalError> {
 
 /// Validates that every relation referenced by a conjunctive body exists and
 /// that every atom matches its declared arity. This is the queries-grain
-/// schema check: the body has no head relation, so unlike
-/// [`validate_arities`] there is nothing written to validate — only the atoms
-/// read. Reused for ordinary rule bodies by [`validate_arities`].
+/// schema check: the body has no head relation, so unlike full-rule arity
+/// validation there is nothing written to validate — only the atoms read. The
+/// same per-clause check is reused when validating ordinary rule bodies.
 ///
 /// # Errors
 ///

@@ -45,12 +45,18 @@ before any design change.
 
 ## Development
 
-- Build / test / lint:
+- The **`Justfile` is the source of truth** for how the workspace is verified;
+  CI shells out to the same recipes. Run the full suite before pushing:
   ```sh
-  cargo build
-  cargo test
-  cargo clippy --all-targets
+  just check          # fmt + clippy + test (--all-features) + doc
   ```
+  Individual recipes: `just fmt`, `just clippy`, `just test`, `just doc`,
+  `just fuzz-quick [ms]`, `just fuzz <target> [seconds]`, `just build`.
+- Use `--all-features` when testing: the differential-fuzz suite
+  (`tests/fuzz_diff.rs`) is gated behind the `arbitrary` feature and is a no-op
+  without it.
+- `just doc` builds docs with `RUSTDOCFLAGS="-D warnings"`, so broken intra-doc
+  links (including links from public items to private ones) fail the build.
 - **Lints are strict and deny-by-default** (see the workspace `Cargo.toml`):
   `warnings`, `missing_docs`, `unsafe_code`, and clippy `all` + `pedantic` are all
   `deny`. Every public item needs a doc-comment; `unsafe` is forbidden;
