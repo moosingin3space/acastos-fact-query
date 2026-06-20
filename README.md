@@ -54,6 +54,60 @@ Layering `fact-query` on top adds parse → form-check → bounded read-only
 evaluation with provenance; see [`fact-query/README.md`](fact-query/README.md) for
 the contract and an example.
 
+## Node.js / TypeScript Binding
+
+A WebAssembly binding is available for Node.js and TypeScript projects via
+`@acastos/fact-query`. See [`fact-query-node/README.md`](fact-query-node/README.md)
+for the full API documentation.
+
+This binding is not automatically built, so in order to make it usable
+on your local machine, follow the below instructions.
+
+### Local development
+
+To build and test the Node.js module locally:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.125
+just node-build    # or: cd fact-query-node && npm install && npm run build
+just node-test     # or: cd fact-query-node && npm test
+```
+
+The build produces a WebAssembly module and TypeScript bindings. After building,
+you can use the binding locally in other projects:
+
+```json
+{
+  "dependencies": {
+    "@acastos/fact-query": "file:../path/to/acastos-fact-query/fact-query-node"
+  }
+}
+```
+
+Then use it in your TypeScript:
+
+```ts
+import { FactEngine } from "@acastos/fact-query";
+
+const engine = FactEngine.fromSource(
+  `relation edge(int, int);
+   relation path(int, int);
+   path(x, y) <-- edge(x, y);
+   path(x, z) <-- edge(x, y), path(y, z);`,
+);
+
+engine.addFacts([
+  { relation: "edge", values: [1n, 2n] },
+  { relation: "edge", values: [2n, 3n] },
+]);
+engine.run();
+
+const { rows, truncated, provenance } = engine.query(
+  "(x, z) <-- path(x, z)",
+);
+```
+
 ## Design
 
 The reasoning behind these crates lives in [`docs/`](docs/):
