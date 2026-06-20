@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = [
+    "ascent-jit",
+    "fact-query",
+]
+# The fuzz crate needs nightly + libFuzzer and is built/run separately with
+# `cargo +nightly fuzz run <target>`; keep it out of the stable workspace.
+exclude = [
+    "ascent-jit/fuzz",
+]
+
+[workspace.package]
+authors = ["Nathan Moos <moosingin3space@gmail.com>"]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/moosingin3space/acastos-fact-query"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+warnings = "deny"
+missing_docs = "deny"
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { priority = -2, level = "deny" }
+pedantic = { priority = -1, level = "deny" }
+mod_module_files = "deny"
+allow_attributes = "deny"

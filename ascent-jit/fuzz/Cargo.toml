@@ -1,0 +1,58 @@
+[package]
+name = "ascent-jit-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = "1.4"
+ascent = "0.8"
+
+[dependencies.ascent-jit]
+path = ".."
+features = ["arbitrary"]
+
+# Each target shares the generators in `ascent_jit::fuzz` with the in-tree
+# `arbtest` suite, so the two harnesses explore the same input space.
+
+[[bin]]
+name = "expr"
+path = "fuzz_targets/expr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "program"
+path = "fuzz_targets/program.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "macro_transitive_closure"
+path = "fuzz_targets/macro_transitive_closure.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "macro_even_odd"
+path = "fuzz_targets/macro_even_odd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "macro_shortest_path"
+path = "fuzz_targets/macro_shortest_path.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent workspace: cargo-fuzz drives this crate on its own.
+[workspace]

@@ -1,0 +1,29 @@
+[package]
+name = "ascent-jit"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "A runtime interpreter for Ascent Datalog programs supplied as data, with a sandboxed WebAssembly expression tier, provenance, and speculative evaluation."
+keywords = ["datalog", "ascent", "wasm", "interpreter", "logic"]
+categories = ["compilers", "data-structures"]
+readme = "../README.md"
+
+[dependencies]
+wasm-encoder = "0.252"
+wasmtime = { version = "45", default-features = false, features = ["cranelift", "runtime"] }
+arbitrary = { version = "1.4", optional = true }
+
+[features]
+# Enables the `fuzz` module: `arbitrary`-based generators and differential
+# checkers shared by the in-tree `arbtest` tests and the `cargo-fuzz` targets.
+arbitrary = ["dep:arbitrary"]
+
+[dev-dependencies]
+ascent = "0.8"
+arbtest = "0.3"
+
+[lints]
+workspace = true

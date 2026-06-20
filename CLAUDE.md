@@ -1,0 +1,71 @@
+# Working in this repository
+
+A two-crate Rust workspace for running Ascent Datalog at runtime and building
+propose-then-verify loops on top of it. Read [`docs/`](docs/) (the design records)
+before any design change.
+
+## The crates
+
+- **`ascent-jit`** — a runtime interpreter for Ascent programs supplied as data.
+  The relational core is an interpreter (a tree-walk of a relational IR with a
+  stratified, semi-naïve fixed-point loop); `if`/`let`/head expressions are
+  lowered to WebAssembly and JIT-compiled under `wasmtime`. Provides query,
+  provenance (`explain`), and speculative (`fork / assert / run / discard`)
+  evaluation.
+- **`fact-query`** — a governance-free proposer/verifier substrate over an
+  `ascent-jit` fact base. The `FactStore` trait is the query seam; `FactSource`
+  is the produce seam. v1 ships the conjunctive **queries grain** only.
+
+`fact-query` depends on `ascent-jit`. Neither crate depends on any application.
+
+## Invariants that are easy to violate
+
+- **Governance-free / dependency direction.** `fact-query` (and `ascent-jit`)
+  must never learn an application's policy vocabulary — denial relations, trust,
+  origin, commit. Policy layers *on top* and must not leak *down*. The crate
+  boundary, enforced by the dependency direction, is the guarantee. Reject any
+  change that names an application concept in these crates.
+- **Provenance is the engine's; trust is the app's.** *Which facts derived a
+  tuple* is an engine concern and stays here. *Trust/origin semantics over
+  provenance* is an application concern, expressed as a lattice in user rules —
+  never an engine builtin.
+- **Fail closed.** An indeterminate evaluation (e.g. the iteration bound is hit)
+  is an error, never silently "nothing derived" / "no violations." A
+  safety-conscious caller must treat it as a denial.
+- **The value model is closed and `Copy`.** `Value` is `{Int(i64) | Bool | Sym}`.
+  Hashing, the WASM bit-bridge, and the differential oracle all rest on this.
+  Don't widen it; lower rich external data to these three kinds (see
+  [docs/0003](docs/0003-external-fact-sources.md)).
+- **The query contract checks form, not meaning.** `eval` returns a `ResultSet`,
+  never an `Answer`. Do not let the API imply intent-fidelity it does not
+  guarantee. See [docs/0002](docs/0002-fact-query-substrate.md).
+- **Bound every evaluation.** Conjunctive query evaluation is capped on
+  *cardinality* (not time); a forgotten cap is a memory-exhaustion DoS. Hitting
+  the cap is a first-class, surfaced outcome, not an error.
+
+## Development
+
+- Build / test / lint:
+  ```sh
+  cargo build
+  cargo test
+  cargo clippy --all-targets
+  ```
+- **Lints are strict and deny-by-default** (see the workspace `Cargo.toml`):
+  `warnings`, `missing_docs`, `unsafe_code`, and clippy `all` + `pedantic` are all
+  `deny`. Every public item needs a doc-comment; `unsafe` is forbidden;
+  `#[allow(...)]` is denied (`allow_attributes`). Write code that passes clean.
+- The `fact-query` crate README is compiled as a doctest (via `include_str!`), so
+  keep its code snippet honest against the public API.
+- The fuzz crate (`ascent-jit/fuzz`) is excluded from the stable workspace and run
+  separately with nightly + `cargo-fuzz`:
+  ```sh
+  cd ascent-jit/fuzz && cargo +nightly fuzz run <target>
+  ```
+  Its `arbitrary`-based generators live in `ascent_jit::fuzz` (behind the
+  `arbitrary` feature) and are shared with the in-tree `arbtest` tests.
+
+## Version control
+
+This repo is managed with [`jj`](https://github.com/jj-vcs/jj) (Jujutsu),
+colocated with git. Use `jj` for commit/stack operations.

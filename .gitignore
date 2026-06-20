@@ -1,0 +1,4 @@
+/target
+/ascent-jit/fuzz/target
+/ascent-jit/fuzz/corpus
+/ascent-jit/fuzz/artifacts
