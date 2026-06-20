@@ -24,6 +24,22 @@ pub trait ExprEval: std::fmt::Debug {
     ///
     /// Returns an [`ExprError`] if evaluation fails (e.g. unbound variable).
     fn eval_expr(&mut self, expr: &Expr, env: &HashMap<Symbol, Value>) -> Result<Value, ExprError>;
+
+    /// Pre-registers a batch of expressions known ahead of time, so a backend
+    /// that compiles can prepare them up front rather than on first evaluation.
+    /// The default is a no-op (e.g. the pure interpreter needs no preparation);
+    /// the WASM backend builds its single module here (see ADR 0005). Passing an
+    /// expression not primed here is still valid — [`ExprEval::eval_expr`]
+    /// prepares it on demand.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ExprError`] if preparation fails (e.g. the WASM module fails
+    /// to compile or instantiate).
+    fn prime(&mut self, exprs: &[&Expr]) -> Result<(), ExprError> {
+        let _ = exprs;
+        Ok(())
+    }
 }
 
 /// An error raised during program validation or evaluation.

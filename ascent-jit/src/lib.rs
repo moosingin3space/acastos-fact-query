@@ -169,12 +169,18 @@ impl Engine {
     /// Returns [`Error`] if the source fails to parse or validate.
     pub fn from_source_with_evaluator(
         src: &str,
-        evaluator: Box<dyn ExprEval>,
+        mut evaluator: Box<dyn ExprEval>,
     ) -> Result<Self, Error> {
         let mut interner = Interner::new();
         let program = parser::parse(src, &mut interner)?;
         // Validate eagerly so a malformed program is rejected at load time.
         eval::stratify(&program)?;
+        // Compile the whole program's expression tier up front (ADR 0005): a
+        // compiling backend builds its single module here so `run` instantiates
+        // nothing. The interpreter's `prime` is a no-op.
+        evaluator
+            .prime(&program.exprs())
+            .map_err(|e| Error::Eval(e.into()))?;
         let db = Database::new(&program);
         Ok(Engine {
             program,

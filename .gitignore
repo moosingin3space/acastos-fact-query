@@ -2,3 +2,4 @@
 /ascent-jit/fuzz/target
 /ascent-jit/fuzz/corpus
 /ascent-jit/fuzz/artifacts
+/ascent-jit-web/target

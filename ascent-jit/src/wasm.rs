@@ -8,14 +8,18 @@
 //!
 //! This file splits into two responsibilities:
 //!
-//! - **Encoding** (`encode_module`) — pure: it turns an [`Expr`] into the
-//!   bytes of a single-function module `f(i64..) -> i64`. It has no runtime
-//!   dependency and compiles to any target, `wasm32` included.
+//! - **Encoding** (`encode_module`) — pure: it turns a set of [`Expr`]s into the
+//!   bytes of a **single** module exporting one function `f{i}(i64..) -> i64`
+//!   per expression. It has no runtime dependency and compiles to any target,
+//!   `wasm32` included. The bytes of each function depend only on the
+//!   expression's structure and the order of its free variables, never on their
+//!   types (see ADR 0005), so one function per distinct [`Expr`] suffices.
 //! - **Execution** — the swappable [`WasmExecutor`] seam: it instantiates those
-//!   bytes and calls `f`. [`WasmtimeExecutor`] is the default, native backend
-//!   (behind the `wasmtime` feature); a browser host can supply its own executor
-//!   over the platform `WebAssembly` engine to evaluate in place. [`WasmEval`]
-//!   is the [`ExprEval`] adapter that caches compiled modules over an executor.
+//!   bytes and calls an exported function by name. [`WasmtimeExecutor`] is the
+//!   default, native backend (behind the `wasmtime` feature); a browser host can
+//!   supply its own executor over the platform `WebAssembly` engine to evaluate
+//!   in place. [`WasmEval`] is the [`ExprEval`] adapter that owns one compiled
+//!   module over an executor, extending it as new expressions appear.
 //!
 //! Every value is represented as an `i64` inside WASM (integers directly,
 //! booleans as `0`/`1`, symbols as their interned id). The host re-tags the
@@ -35,69 +39,82 @@ use crate::eval::ExprEval;
 use crate::expr::{BinOp, Expr, ExprError, UnOp};
 use crate::value::{Symbol, Type, Value};
 
-/// Runs an encoded, import-free WASM module that exports a single function
-/// `f(i64..) -> i64`.
+/// Runs an encoded, import-free WASM module that exports one function
+/// `f{i}(i64..) -> i64` per expression.
 ///
 /// This is the seam that makes the expression runtime swappable. The module
 /// *encoding* (`encode_module`) is shared and pure; an executor only decides
-/// how the resulting bytes are instantiated and called. [`WasmtimeExecutor`] is
-/// the default native implementation; a browser host can implement this over the
-/// platform `WebAssembly` engine so fact queries evaluate in place without a
-/// native runtime.
+/// how the resulting bytes are instantiated and which exported function a call
+/// selects. [`WasmtimeExecutor`] is the default native implementation; a browser
+/// host can implement this over the platform `WebAssembly` engine so fact
+/// queries evaluate in place without a native runtime.
 ///
 /// Implementations marshal each argument as an `i64` (integers directly,
-/// booleans as `0`/`1`, symbols as their interned id) and return the function's
-/// single `i64` result; the caller re-tags it using the expression's inferred
-/// [`Type`].
+/// booleans as `0`/`1`, symbols as their interned id) and return the selected
+/// function's single `i64` result; the caller re-tags it using the expression's
+/// inferred [`Type`].
 pub trait WasmExecutor {
-    /// A compiled module, instantiated and ready to be called repeatedly
-    /// (compile-once / call-many — [`WasmEval`] caches one per expression shape).
+    /// A compiled module, instantiated and ready to have any of its exported
+    /// functions called repeatedly (compile-once / call-many — [`WasmEval`]
+    /// keeps a single instance covering every expression seen so far).
     type Module;
 
-    /// Instantiates the module `bytes` and returns a handle to its exported `f`.
+    /// Instantiates the module `bytes` and returns a handle to the instance.
     ///
     /// # Errors
     ///
     /// Returns [`ExprError::Runtime`] if the bytes fail to compile or
-    /// instantiate, or do not export `f`.
+    /// instantiate.
     fn instantiate(&mut self, bytes: &[u8]) -> Result<Self::Module, ExprError>;
 
-    /// Calls the previously instantiated `module`'s `f` with `args` and returns
-    /// its `i64` result.
+    /// Calls the previously instantiated `module`'s exported function `func`
+    /// with `args` and returns its `i64` result.
     ///
     /// # Errors
     ///
-    /// Returns [`ExprError::Runtime`] if the call traps or returns an
-    /// unexpected result.
-    fn call(&mut self, module: &Self::Module, args: &[i64]) -> Result<i64, ExprError>;
+    /// Returns [`ExprError::Runtime`] if `func` is not exported, or the call
+    /// traps or returns an unexpected result.
+    fn call(&mut self, module: &Self::Module, func: &str, args: &[i64]) -> Result<i64, ExprError>;
 }
 
-/// A compiled expression: its executor-specific module handle plus the metadata
-/// needed to marshal arguments in and tag the result.
-struct Compiled<M> {
-    module: M,
-    params: Vec<Symbol>,
-    result_ty: Type,
+/// The export name of the function for expression index `i` (`f0`, `f1`, …).
+fn func_name(index: usize) -> String {
+    format!("f{index}")
 }
-
-/// Cache key: an expression *plus* the types of its free variables (in
-/// [`Expr::collect_vars`] order). The types are load-bearing — the same
-/// expression (e.g. `Var(x)`) can appear in two rules where `x` is bound to
-/// columns of different types, which changes how the `i64` result is re-tagged.
-/// Keying on the `Expr` alone would alias those and decode with the wrong type.
-type CacheKey = (Expr, Vec<Type>);
 
 /// Lowers expressions to WASM and evaluates them over a pluggable
-/// [`WasmExecutor`], caching one compiled module per expression shape.
+/// [`WasmExecutor`].
+///
+/// All known expressions live in **one** module exporting `f{i}` per expression
+/// (ADR 0005). The module is (re-)instantiated whenever a not-yet-seen
+/// expression is registered — eagerly in bulk via [`WasmEval::prime`], or one at
+/// a time when [`eval_expr`](ExprEval::eval_expr) meets an ad-hoc query
+/// expression. Because a function's bytes are type-independent, there is exactly
+/// one function per distinct [`Expr`]; the free-variable types only choose how
+/// the `i64` result is re-tagged, which is cached as metadata.
 pub struct WasmEval<E: WasmExecutor> {
     executor: E,
-    cache: HashMap<CacheKey, Compiled<E::Module>>,
+    /// Distinct expressions, in stable index order; expression `i` is exported
+    /// as `f{i}`. Parallel to `params`.
+    exprs: Vec<Expr>,
+    /// The free variables of each expression, in [`Expr::collect_vars`] order —
+    /// the argument order for `f{i}`. Parallel to `exprs`.
+    params: Vec<Vec<Symbol>>,
+    /// `Expr` → its index in `exprs`.
+    index: HashMap<Expr, usize>,
+    /// The single instance covering `f0..f{exprs.len()-1}`; `None` until the
+    /// first expression is registered.
+    module: Option<E::Module>,
+    /// Cached result types for re-tagging, keyed on `(expression index, free-var
+    /// types in `params` order)`. The same expression re-tags differently when
+    /// its variables bind columns of different types.
+    result_ty: HashMap<(usize, Vec<Type>), Type>,
 }
 
 impl<E: WasmExecutor> std::fmt::Debug for WasmEval<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WasmEval")
-            .field("cached", &self.cache.len())
+            .field("functions", &self.exprs.len())
             .finish_non_exhaustive()
     }
 }
@@ -111,33 +128,44 @@ impl<E: WasmExecutor> WasmEval<E> {
     pub fn with_executor(executor: E) -> Self {
         WasmEval {
             executor,
-            cache: HashMap::new(),
+            exprs: Vec::new(),
+            params: Vec::new(),
+            index: HashMap::new(),
+            module: None,
+            result_ty: HashMap::new(),
         }
     }
 
-    fn compile(
-        &mut self,
-        expr: &Expr,
-        params: &[Symbol],
-        param_types: &[Type],
-    ) -> Result<(), ExprError> {
-        let type_env: HashMap<Symbol, Type> = params
-            .iter()
-            .copied()
-            .zip(param_types.iter().copied())
-            .collect();
-        let result_ty = expr.infer(&type_env)?;
-        let bytes = encode_module(expr, params);
-        let module = self.executor.instantiate(&bytes)?;
-        self.cache.insert(
-            (expr.clone(), param_types.to_vec()),
-            Compiled {
-                module,
-                params: params.to_vec(),
-                result_ty,
-            },
-        );
+    /// Registers `expr` (computing its argument order) without rebuilding, and
+    /// returns whether it was newly added.
+    fn register(&mut self, expr: &Expr) -> bool {
+        if self.index.contains_key(expr) {
+            return false;
+        }
+        let i = self.exprs.len();
+        let mut params = Vec::new();
+        expr.collect_vars(&mut params);
+        self.exprs.push(expr.clone());
+        self.params.push(params);
+        self.index.insert(expr.clone(), i);
+        true
+    }
+
+    /// Re-encodes and re-instantiates the single module over every registered
+    /// expression.
+    fn rebuild(&mut self) -> Result<(), ExprError> {
+        let bytes = encode_module(&self.exprs, &self.params);
+        self.module = Some(self.executor.instantiate(&bytes)?);
         Ok(())
+    }
+
+    /// Ensures `expr` has a compiled function, rebuilding the module if it was
+    /// not already present, and returns its index.
+    fn ensure(&mut self, expr: &Expr) -> Result<usize, ExprError> {
+        if self.register(expr) {
+            self.rebuild()?;
+        }
+        Ok(self.index[expr])
     }
 }
 
@@ -155,31 +183,55 @@ impl WasmEval<WasmtimeExecutor> {
 }
 
 impl<E: WasmExecutor> ExprEval for WasmEval<E> {
+    fn prime(&mut self, exprs: &[&Expr]) -> Result<(), ExprError> {
+        let mut added = false;
+        for expr in exprs {
+            added |= self.register(expr);
+        }
+        if added {
+            self.rebuild()?;
+        }
+        Ok(())
+    }
+
     fn eval_expr(&mut self, expr: &Expr, env: &HashMap<Symbol, Value>) -> Result<Value, ExprError> {
-        let mut params = Vec::new();
-        expr.collect_vars(&mut params);
-        let mut param_types = Vec::with_capacity(params.len());
-        for p in &params {
-            param_types.push(env.get(p).ok_or(ExprError::UnboundVar(*p))?.type_of());
+        let i = self.ensure(expr)?;
+        // Marshal arguments in the function's parameter order and read off the
+        // free-variable types for the result-type cache key.
+        let mut param_types = Vec::with_capacity(self.params[i].len());
+        let mut args = Vec::with_capacity(self.params[i].len());
+        for p in &self.params[i] {
+            let v = env.get(p).ok_or(ExprError::UnboundVar(*p))?;
+            param_types.push(v.type_of());
+            args.push(v.to_bits());
         }
-        let key = (expr.clone(), param_types);
-        if !self.cache.contains_key(&key) {
-            self.compile(expr, &params, &key.1)?;
-        }
-        // Build the argument vector and read the result type while borrowing the
-        // cache, then drop that borrow before the call — which needs `&mut` on a
-        // disjoint field (the executor).
-        let (args, result_ty) = {
-            let compiled = &self.cache[&key];
-            let mut args = Vec::with_capacity(compiled.params.len());
-            for p in &compiled.params {
-                let v = env.get(p).ok_or(ExprError::UnboundVar(*p))?;
-                args.push(v.to_bits());
-            }
-            (args, compiled.result_ty)
-        };
-        let bits = self.executor.call(&self.cache[&key].module, &args)?;
+        let result_ty = self.result_type(i, param_types)?;
+        let func = func_name(i);
+        // `module` and `executor` are disjoint fields, so the shared borrow of
+        // the instance coexists with the `&mut` call into the executor.
+        let module = self.module.as_ref().expect("module built by ensure");
+        let bits = self.executor.call(module, &func, &args)?;
         Ok(Value::from_bits(bits, result_ty))
+    }
+}
+
+impl<E: WasmExecutor> WasmEval<E> {
+    /// Returns the [`Type`] to re-tag `f{index}`'s `i64` result with, given its
+    /// free-variable `param_types` (in `params` order), inferring and caching it
+    /// on first use.
+    fn result_type(&mut self, index: usize, param_types: Vec<Type>) -> Result<Type, ExprError> {
+        let key = (index, param_types);
+        if let Some(ty) = self.result_ty.get(&key) {
+            return Ok(*ty);
+        }
+        let type_env: HashMap<Symbol, Type> = self.params[index]
+            .iter()
+            .copied()
+            .zip(key.1.iter().copied())
+            .collect();
+        let ty = self.exprs[index].infer(&type_env)?;
+        self.result_ty.insert(key, ty);
+        Ok(ty)
     }
 }
 
@@ -222,22 +274,21 @@ impl WasmtimeExecutor {
 
 #[cfg(feature = "wasmtime")]
 impl WasmExecutor for WasmtimeExecutor {
-    type Module = wasmtime::Func;
+    type Module = wasmtime::Instance;
 
     fn instantiate(&mut self, bytes: &[u8]) -> Result<Self::Module, ExprError> {
         let module = wasmtime::Module::new(&self.engine, bytes).map_err(runtime)?;
-        let instance = wasmtime::Instance::new(&mut self.store, &module, &[]).map_err(runtime)?;
-        instance
-            .get_func(&mut self.store, "f")
-            .ok_or_else(|| ExprError::Runtime("missing export `f`".to_owned()))
+        wasmtime::Instance::new(&mut self.store, &module, &[]).map_err(runtime)
     }
 
-    fn call(&mut self, module: &Self::Module, args: &[i64]) -> Result<i64, ExprError> {
+    fn call(&mut self, module: &Self::Module, func: &str, args: &[i64]) -> Result<i64, ExprError> {
+        let f = module
+            .get_func(&mut self.store, func)
+            .ok_or_else(|| ExprError::Runtime(format!("missing export `{func}`")))?;
         let args: Vec<wasmtime::Val> = args.iter().map(|&a| wasmtime::Val::I64(a)).collect();
         self.store.set_fuel(FUEL_PER_CALL).map_err(runtime)?;
         let mut results = [wasmtime::Val::I64(0)];
-        module
-            .call(&mut self.store, &args, &mut results)
+        f.call(&mut self.store, &args, &mut results)
             .map_err(runtime)?;
         match results[0] {
             wasmtime::Val::I64(b) => Ok(b),
@@ -251,35 +302,54 @@ fn runtime(e: impl std::fmt::Display) -> ExprError {
     ExprError::Runtime(e.to_string())
 }
 
-/// Encodes `expr` as a single-function WASM module `f(params...) -> i64`.
-fn encode_module(expr: &Expr, params: &[Symbol]) -> Vec<u8> {
+/// Encodes `exprs` as a single WASM module exporting one function
+/// `f{i}(params...) -> i64` per expression. `params[i]` is the argument order
+/// (free variables) of `exprs[i]`; the two slices are parallel.
+fn encode_module(exprs: &[Expr], params: &[Vec<Symbol>]) -> Vec<u8> {
     let mut module = Module::new();
 
+    // One function type per expression — arities differ, and a distinct type per
+    // function keeps the index alignment (type i ↔ function i ↔ export `f{i}`)
+    // trivial.
     let mut types = TypeSection::new();
-    let param_types = vec![ValType::I64; params.len()];
-    types.ty().function(param_types, vec![ValType::I64]);
+    for p in params {
+        types
+            .ty()
+            .function(vec![ValType::I64; p.len()], vec![ValType::I64]);
+    }
     module.section(&types);
 
     let mut functions = FunctionSection::new();
-    functions.function(0);
+    for i in 0..exprs.len() {
+        functions.function(idx(i));
+    }
     module.section(&functions);
 
     let mut exports = ExportSection::new();
-    exports.export("f", ExportKind::Func, 0);
+    for i in 0..exprs.len() {
+        exports.export(&func_name(i), ExportKind::Func, idx(i));
+    }
     module.section(&exports);
 
     let mut codes = CodeSection::new();
-    let mut f = Function::new(Vec::new());
-    let mut instrs = Vec::new();
-    emit(expr, params, &mut instrs);
-    for instr in &instrs {
-        f.instruction(instr);
+    for (expr, p) in exprs.iter().zip(params) {
+        let mut f = Function::new(Vec::new());
+        let mut instrs = Vec::new();
+        emit(expr, p, &mut instrs);
+        for instr in &instrs {
+            f.instruction(instr);
+        }
+        f.instruction(&Instruction::End);
+        codes.function(&f);
     }
-    f.instruction(&Instruction::End);
-    codes.function(&f);
     module.section(&codes);
 
     module.finish()
+}
+
+/// A `usize` index narrowed to the `u32` the WASM sections use.
+fn idx(i: usize) -> u32 {
+    u32::try_from(i).expect("function index fits u32")
 }
 
 /// Emits instructions that leave the `i64` value of `expr` on the stack.

@@ -159,4 +159,30 @@ impl Program {
     pub fn relation(&self, name: &str) -> Option<&RelationDecl> {
         self.relations.iter().find(|r| r.name == name)
     }
+
+    /// Collects every top-level expression the rules evaluate: each head-atom
+    /// column expression and each body `if` condition, `let` binding, and
+    /// aggregate argument. These are exactly the expressions handed to
+    /// [`ExprEval::eval_expr`](crate::eval::ExprEval::eval_expr) during a run, so
+    /// a compiling backend can prime them all up front
+    /// ([`ExprEval::prime`](crate::eval::ExprEval::prime)). Sub-expressions are
+    /// not listed separately — they are inlined into their enclosing
+    /// expression's compiled function.
+    #[must_use]
+    pub fn exprs(&self) -> Vec<&Expr> {
+        let mut out = Vec::new();
+        for rule in &self.rules {
+            for head in &rule.heads {
+                out.extend(head.args.iter());
+            }
+            for clause in &rule.body {
+                match clause {
+                    BodyClause::Condition(e) | BodyClause::Let { expr: e, .. } => out.push(e),
+                    BodyClause::Aggregate(agg) => out.extend(agg.arg.iter()),
+                    BodyClause::Positive(_) | BodyClause::Negative(_) => {}
+                }
+            }
+        }
+        out
+    }
 }
