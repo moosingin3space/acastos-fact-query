@@ -1,6 +1,6 @@
 # Working in this repository
 
-A two-crate Rust workspace for running Ascent Datalog at runtime and building
+A Rust workspace for running Ascent Datalog at runtime and building
 propose-then-verify loops on top of it. Read [`docs/`](docs/) (the design records)
 before any design change.
 
@@ -9,14 +9,22 @@ before any design change.
 - **`ascent-jit`** — a runtime interpreter for Ascent programs supplied as data.
   The relational core is an interpreter (a tree-walk of a relational IR with a
   stratified, semi-naïve fixed-point loop); `if`/`let`/head expressions are
-  lowered to WebAssembly and JIT-compiled under `wasmtime`. Provides query,
+  lowered to WebAssembly and run through a swappable `WasmExecutor`. The default
+  executor (`WasmtimeExecutor`, behind the on-by-default `wasmtime` feature)
+  JIT-compiles under `wasmtime`; encoding is shared and runtime-free, so the
+  crate also builds `--no-default-features` for `wasm32`. Provides query,
   provenance (`explain`), and speculative (`fork / assert / run / discard`)
-  evaluation.
+  evaluation. See [docs/0004](docs/0004-pluggable-wasm-execution.md).
 - **`fact-query`** — a governance-free proposer/verifier substrate over an
   `ascent-jit` fact base. The `FactStore` trait is the query seam; `FactSource`
   is the produce seam. v1 ships the conjunctive **queries grain** only.
+- **`ascent-jit-web`** — a `wasm32`-only, workspace-*excluded* crate (like
+  `ascent-jit/fuzz`): a `WasmExecutor` over the browser's `WebAssembly` engine so
+  queries evaluate in place in the page. Built separately:
+  `cargo build -p ascent-jit-web --target wasm32-unknown-unknown`.
 
-`fact-query` depends on `ascent-jit`. Neither crate depends on any application.
+`fact-query` and `ascent-jit-web` depend on `ascent-jit`. No crate depends on any
+application.
 
 ## Invariants that are easy to violate
 

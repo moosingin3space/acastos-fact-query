@@ -9,6 +9,7 @@ order, but each stands on its own.
 | [0001](0001-ascent-jit-runtime-engine.md) | A runtime interpreter for Ascent | Why the engine runs Datalog supplied *as data*, the interpreter + WebAssembly expression tier, provenance, the bounded fixed point, and speculative evaluation. |
 | [0002](0002-fact-query-substrate.md) | The `fact-query` proposer/verifier substrate | The recurring propose → speculate → (delta, provenance) → net primitive, the governance-free boundary, the queries grain, and the five-guarantee contract. |
 | [0003](0003-external-fact-sources.md) | A pluggable external fact-source seam | The produce-side `FactSource` seam, the schema contract (column types + drift detection), lowering rich external tuples into the closed value model, and content-addressed identity. |
+| [0004](0004-pluggable-wasm-execution.md) | A pluggable WebAssembly execution tier | Splitting the expression tier into shared *encoding* and a swappable `WasmExecutor`, making `wasmtime` an optional default feature, and the `wasm32` `ascent-jit-web` crate that runs queries in the browser in place. Why fuel is a `wasmtime` detail, not a contract. |
 
 ## Conventions
 

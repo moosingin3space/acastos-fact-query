@@ -12,7 +12,14 @@ categories = ["data-structures", "database"]
 readme = "README.md"
 
 [dependencies]
-ascent-jit = { path = "../ascent-jit", version = "0.1.0" }
+ascent-jit = { path = "../ascent-jit", version = "0.1.0", default-features = false }
+
+[features]
+default = ["wasmtime"]
+# Forwards `ascent-jit`'s default native executor. Build with
+# `--no-default-features` for a `wasm32` consumer that supplies its own
+# `WasmExecutor` and constructs the engine itself.
+wasmtime = ["ascent-jit/wasmtime"]
 
 [lints]
 workspace = true

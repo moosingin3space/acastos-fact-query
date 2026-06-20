@@ -13,13 +13,20 @@ readme = "../README.md"
 
 [dependencies]
 wasm-encoder = "0.252"
-wasmtime = { version = "45", default-features = false, features = ["cranelift", "runtime"] }
+wasmtime = { version = "45", default-features = false, features = ["cranelift", "runtime"], optional = true }
 arbitrary = { version = "1.4", optional = true }
 
 [features]
+default = ["wasmtime"]
+# The default native expression executor (`WasmtimeExecutor`). Optional so the
+# crate builds for `wasm32` targets that supply their own `WasmExecutor` (e.g. a
+# browser host over the platform `WebAssembly` engine). The pure-interpreter and
+# module-encoding paths do not need it.
+wasmtime = ["dep:wasmtime"]
 # Enables the `fuzz` module: `arbitrary`-based generators and differential
 # checkers shared by the in-tree `arbtest` tests and the `cargo-fuzz` targets.
-arbitrary = ["dep:arbitrary"]
+# Pulls in `wasmtime` because the differential oracle runs the wasm executor.
+arbitrary = ["dep:arbitrary", "wasmtime"]
 
 [dev-dependencies]
 ascent = "0.8"

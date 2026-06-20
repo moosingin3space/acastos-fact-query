@@ -33,14 +33,17 @@ pub mod wasm;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::eval::{Database, EvalError, ExprEval};
-use crate::expr::{Expr, ExprError};
+use crate::eval::{Database, EvalError};
+use crate::expr::Expr;
 use crate::ir::{BodyClause, Program};
 use crate::parser::ParseError;
-use crate::wasm::WasmEval;
 
-pub use crate::eval::{Derivation, QueryOutput, QuerySolution};
+pub use crate::eval::{Derivation, ExprEval, QueryOutput, QuerySolution};
+pub use crate::expr::ExprError;
 pub use crate::value::{Interner, Symbol, Type, Value};
+#[cfg(feature = "wasmtime")]
+pub use crate::wasm::WasmtimeExecutor;
+pub use crate::wasm::{WasmEval, WasmExecutor};
 
 /// Any error produced by the engine.
 #[derive(Debug)]
@@ -50,6 +53,7 @@ pub enum Error {
     /// Validation or evaluation failed.
     Eval(EvalError),
     /// The WASM expression tier failed to initialise.
+    #[cfg(feature = "wasmtime")]
     Wasm(ExprError),
 }
 
@@ -58,6 +62,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Parse(e) => write!(f, "{e}"),
             Error::Eval(e) => write!(f, "{e}"),
+            #[cfg(feature = "wasmtime")]
             Error::Wasm(e) => write!(f, "{e}"),
         }
     }
@@ -132,15 +137,17 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Parses `src` and builds an engine backed by the WASM expression tier.
+    /// Parses `src` and builds an engine backed by the default `wasmtime` WASM
+    /// expression tier.
     ///
     /// # Errors
     ///
     /// Returns [`Error`] if the source fails to parse, the program fails
     /// validation/stratification, or the WASM engine cannot be initialised.
+    #[cfg(feature = "wasmtime")]
     pub fn from_source(src: &str) -> Result<Self, Error> {
         let evaluator = WasmEval::new().map_err(Error::Wasm)?;
-        Self::from_source_with(src, Box::new(evaluator))
+        Self::from_source_with_evaluator(src, Box::new(evaluator))
     }
 
     /// Parses `src` and builds an engine backed by the pure interpreter.
@@ -149,10 +156,21 @@ impl Engine {
     ///
     /// Returns [`Error`] if the source fails to parse or validate.
     pub fn from_source_interpreted(src: &str) -> Result<Self, Error> {
-        Self::from_source_with(src, Box::new(Interpreter))
+        Self::from_source_with_evaluator(src, Box::new(Interpreter))
     }
 
-    fn from_source_with(src: &str, evaluator: Box<dyn ExprEval>) -> Result<Self, Error> {
+    /// Parses `src` and builds an engine over a caller-supplied expression
+    /// evaluator. This is the executor-swapping entry point: a host without
+    /// `wasmtime` (e.g. browser-wasm) passes a [`WasmEval`] built over its own
+    /// [`WasmExecutor`], reusing the entire encoding pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if the source fails to parse or validate.
+    pub fn from_source_with_evaluator(
+        src: &str,
+        evaluator: Box<dyn ExprEval>,
+    ) -> Result<Self, Error> {
         let mut interner = Interner::new();
         let program = parser::parse(src, &mut interner)?;
         // Validate eagerly so a malformed program is rejected at load time.

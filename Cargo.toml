@@ -4,10 +4,13 @@ members = [
     "ascent-jit",
     "fact-query",
 ]
-# The fuzz crate needs nightly + libFuzzer and is built/run separately with
-# `cargo +nightly fuzz run <target>`; keep it out of the stable workspace.
+# Crates built/run outside the stable native workspace:
+# - `ascent-jit/fuzz` needs nightly + libFuzzer (`cargo +nightly fuzz run`).
+# - `ascent-jit-web` is wasm32-only (`cargo build -p ascent-jit-web --target
+#   wasm32-unknown-unknown`); it pulls browser-only deps (js-sys/wasm-bindgen).
 exclude = [
     "ascent-jit/fuzz",
+    "ascent-jit-web",
 ]
 
 [workspace.package]

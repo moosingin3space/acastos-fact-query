@@ -2,16 +2,27 @@
 //! JIT-compiled.
 //!
 //! Each `if`/`let`/head expression is lowered from the [`Expr`] IR directly to
-//! WebAssembly bytecode (via `wasm-encoder` — no compiler invocation) and run
-//! under `wasmtime`, whose Cranelift backend compiles it to machine code.
-//! Execution is **fuel-metered** (an expression cannot wedge the fixed-point
-//! loop) and the module imports **nothing** (no I/O, no syscalls), so an
-//! LLM-authored expression is sandboxed structurally rather than by hand.
+//! WebAssembly bytecode (via `wasm-encoder` — no compiler invocation). The
+//! module imports **nothing** (no I/O, no syscalls), so an LLM-authored
+//! expression is sandboxed structurally rather than by hand.
+//!
+//! This file splits into two responsibilities:
+//!
+//! - **Encoding** (`encode_module`) — pure: it turns an [`Expr`] into the
+//!   bytes of a single-function module `f(i64..) -> i64`. It has no runtime
+//!   dependency and compiles to any target, `wasm32` included.
+//! - **Execution** — the swappable [`WasmExecutor`] seam: it instantiates those
+//!   bytes and calls `f`. [`WasmtimeExecutor`] is the default, native backend
+//!   (behind the `wasmtime` feature); a browser host can supply its own executor
+//!   over the platform `WebAssembly` engine to evaluate in place. [`WasmEval`]
+//!   is the [`ExprEval`] adapter that caches compiled modules over an executor.
 //!
 //! Every value is represented as an `i64` inside WASM (integers directly,
 //! booleans as `0`/`1`, symbols as their interned id). The host re-tags the
 //! result using the expression's inferred [`Type`]. The pure interpreter in
-//! [`crate::expr`] is the differential oracle: the two must always agree.
+//! [`crate::expr`] is the differential oracle: every executor must agree with
+//! it. Because the *bytes* are shared, executors differ only in how they run an
+//! identical module — so the oracle pins them all.
 
 use std::collections::HashMap;
 
@@ -19,20 +30,52 @@ use wasm_encoder::{
     BlockType, CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction,
     Module, TypeSection, ValType,
 };
-use wasmtime::{Config, Engine, Func, Instance, Store, Val};
 
 use crate::eval::ExprEval;
 use crate::expr::{BinOp, Expr, ExprError, UnOp};
 use crate::value::{Symbol, Type, Value};
 
-/// Fuel granted to a single expression evaluation. Generous for the trivial
-/// arithmetic and boolean expressions Ascent rules contain, but finite.
-const FUEL_PER_CALL: u64 = 100_000;
+/// Runs an encoded, import-free WASM module that exports a single function
+/// `f(i64..) -> i64`.
+///
+/// This is the seam that makes the expression runtime swappable. The module
+/// *encoding* (`encode_module`) is shared and pure; an executor only decides
+/// how the resulting bytes are instantiated and called. [`WasmtimeExecutor`] is
+/// the default native implementation; a browser host can implement this over the
+/// platform `WebAssembly` engine so fact queries evaluate in place without a
+/// native runtime.
+///
+/// Implementations marshal each argument as an `i64` (integers directly,
+/// booleans as `0`/`1`, symbols as their interned id) and return the function's
+/// single `i64` result; the caller re-tags it using the expression's inferred
+/// [`Type`].
+pub trait WasmExecutor {
+    /// A compiled module, instantiated and ready to be called repeatedly
+    /// (compile-once / call-many — [`WasmEval`] caches one per expression shape).
+    type Module;
 
-/// A compiled expression: its WASM function plus the metadata needed to marshal
-/// arguments in and tag the result.
-struct Compiled {
-    func: Func,
+    /// Instantiates the module `bytes` and returns a handle to its exported `f`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExprError::Runtime`] if the bytes fail to compile or
+    /// instantiate, or do not export `f`.
+    fn instantiate(&mut self, bytes: &[u8]) -> Result<Self::Module, ExprError>;
+
+    /// Calls the previously instantiated `module`'s `f` with `args` and returns
+    /// its `i64` result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExprError::Runtime`] if the call traps or returns an
+    /// unexpected result.
+    fn call(&mut self, module: &Self::Module, args: &[i64]) -> Result<i64, ExprError>;
+}
+
+/// A compiled expression: its executor-specific module handle plus the metadata
+/// needed to marshal arguments in and tag the result.
+struct Compiled<M> {
+    module: M,
     params: Vec<Symbol>,
     result_ty: Type,
 }
@@ -44,14 +87,14 @@ struct Compiled {
 /// Keying on the `Expr` alone would alias those and decode with the wrong type.
 type CacheKey = (Expr, Vec<Type>);
 
-/// Lowers expressions to WASM and evaluates them under `wasmtime`.
-pub struct WasmEval {
-    engine: Engine,
-    store: Store<()>,
-    cache: HashMap<CacheKey, Compiled>,
+/// Lowers expressions to WASM and evaluates them over a pluggable
+/// [`WasmExecutor`], caching one compiled module per expression shape.
+pub struct WasmEval<E: WasmExecutor> {
+    executor: E,
+    cache: HashMap<CacheKey, Compiled<E::Module>>,
 }
 
-impl std::fmt::Debug for WasmEval {
+impl<E: WasmExecutor> std::fmt::Debug for WasmEval<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WasmEval")
             .field("cached", &self.cache.len())
@@ -59,22 +102,17 @@ impl std::fmt::Debug for WasmEval {
     }
 }
 
-impl WasmEval {
-    /// Creates a fuel-metered, import-free WASM expression engine.
+impl<E: WasmExecutor> WasmEval<E> {
+    /// Builds an expression evaluator over a given executor.
     ///
-    /// # Errors
-    ///
-    /// Returns [`ExprError::Runtime`] if the `wasmtime` engine cannot be built.
-    pub fn new() -> Result<Self, ExprError> {
-        let mut config = Config::new();
-        config.consume_fuel(true);
-        let engine = Engine::new(&config).map_err(runtime)?;
-        let store = Store::new(&engine, ());
-        Ok(WasmEval {
-            engine,
-            store,
+    /// This is the executor-swapping entry point: a host that cannot run
+    /// `wasmtime` (e.g. a browser-wasm context) supplies its own
+    /// [`WasmExecutor`] here and otherwise reuses the whole encoding pipeline.
+    pub fn with_executor(executor: E) -> Self {
+        WasmEval {
+            executor,
             cache: HashMap::new(),
-        })
+        }
     }
 
     fn compile(
@@ -90,15 +128,11 @@ impl WasmEval {
             .collect();
         let result_ty = expr.infer(&type_env)?;
         let bytes = encode_module(expr, params);
-        let module = wasmtime::Module::new(&self.engine, &bytes).map_err(runtime)?;
-        let instance = Instance::new(&mut self.store, &module, &[]).map_err(runtime)?;
-        let func = instance
-            .get_func(&mut self.store, "f")
-            .ok_or_else(|| ExprError::Runtime("missing export `f`".to_owned()))?;
+        let module = self.executor.instantiate(&bytes)?;
         self.cache.insert(
             (expr.clone(), param_types.to_vec()),
             Compiled {
-                func,
+                module,
                 params: params.to_vec(),
                 result_ty,
             },
@@ -107,7 +141,20 @@ impl WasmEval {
     }
 }
 
-impl ExprEval for WasmEval {
+#[cfg(feature = "wasmtime")]
+impl WasmEval<WasmtimeExecutor> {
+    /// Creates a fuel-metered, import-free WASM expression engine backed by
+    /// `wasmtime` — the default native executor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExprError::Runtime`] if the `wasmtime` engine cannot be built.
+    pub fn new() -> Result<Self, ExprError> {
+        Ok(WasmEval::with_executor(WasmtimeExecutor::new()?))
+    }
+}
+
+impl<E: WasmExecutor> ExprEval for WasmEval<E> {
     fn eval_expr(&mut self, expr: &Expr, env: &HashMap<Symbol, Value>) -> Result<Value, ExprError> {
         let mut params = Vec::new();
         expr.collect_vars(&mut params);
@@ -119,26 +166,87 @@ impl ExprEval for WasmEval {
         if !self.cache.contains_key(&key) {
             self.compile(expr, &params, &key.1)?;
         }
-        let compiled = &self.cache[&key];
-        let mut args = Vec::with_capacity(compiled.params.len());
-        for p in &compiled.params {
-            let v = env.get(p).ok_or(ExprError::UnboundVar(*p))?;
-            args.push(Val::I64(v.to_bits()));
-        }
-        let func = compiled.func;
-        let result_ty = compiled.result_ty;
-        self.store.set_fuel(FUEL_PER_CALL).map_err(runtime)?;
-        let mut results = [Val::I64(0)];
-        func.call(&mut self.store, &args, &mut results)
-            .map_err(runtime)?;
-        let bits = match results[0] {
-            Val::I64(b) => b,
-            ref other => return Err(ExprError::Runtime(format!("unexpected result {other:?}"))),
+        // Build the argument vector and read the result type while borrowing the
+        // cache, then drop that borrow before the call — which needs `&mut` on a
+        // disjoint field (the executor).
+        let (args, result_ty) = {
+            let compiled = &self.cache[&key];
+            let mut args = Vec::with_capacity(compiled.params.len());
+            for p in &compiled.params {
+                let v = env.get(p).ok_or(ExprError::UnboundVar(*p))?;
+                args.push(v.to_bits());
+            }
+            (args, compiled.result_ty)
         };
+        let bits = self.executor.call(&self.cache[&key].module, &args)?;
         Ok(Value::from_bits(bits, result_ty))
     }
 }
 
+/// The default native [`WasmExecutor`]: runs modules under `wasmtime`, whose
+/// Cranelift backend compiles them to machine code. Execution is
+/// **fuel-metered** so an expression cannot wedge the fixed-point loop.
+#[cfg(feature = "wasmtime")]
+#[derive(Debug)]
+pub struct WasmtimeExecutor {
+    engine: wasmtime::Engine,
+    store: wasmtime::Store<()>,
+}
+
+/// Fuel granted to a single expression evaluation. Generous for the trivial
+/// arithmetic and boolean expressions Ascent rules contain, but finite.
+///
+/// Fuel is a `wasmtime`-specific backstop, not a correctness requirement: the
+/// modules `encode_module` emits are straight-line (arithmetic plus
+/// `if`/`else` blocks — no loops, calls, or back-edges), so they terminate
+/// structurally. An executor on a runtime without fuel is therefore still safe
+/// for *these* modules.
+#[cfg(feature = "wasmtime")]
+const FUEL_PER_CALL: u64 = 100_000;
+
+#[cfg(feature = "wasmtime")]
+impl WasmtimeExecutor {
+    /// Builds a fuel-metered `wasmtime` engine and store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExprError::Runtime`] if the `wasmtime` engine cannot be built.
+    pub fn new() -> Result<Self, ExprError> {
+        let mut config = wasmtime::Config::new();
+        config.consume_fuel(true);
+        let engine = wasmtime::Engine::new(&config).map_err(runtime)?;
+        let store = wasmtime::Store::new(&engine, ());
+        Ok(WasmtimeExecutor { engine, store })
+    }
+}
+
+#[cfg(feature = "wasmtime")]
+impl WasmExecutor for WasmtimeExecutor {
+    type Module = wasmtime::Func;
+
+    fn instantiate(&mut self, bytes: &[u8]) -> Result<Self::Module, ExprError> {
+        let module = wasmtime::Module::new(&self.engine, bytes).map_err(runtime)?;
+        let instance = wasmtime::Instance::new(&mut self.store, &module, &[]).map_err(runtime)?;
+        instance
+            .get_func(&mut self.store, "f")
+            .ok_or_else(|| ExprError::Runtime("missing export `f`".to_owned()))
+    }
+
+    fn call(&mut self, module: &Self::Module, args: &[i64]) -> Result<i64, ExprError> {
+        let args: Vec<wasmtime::Val> = args.iter().map(|&a| wasmtime::Val::I64(a)).collect();
+        self.store.set_fuel(FUEL_PER_CALL).map_err(runtime)?;
+        let mut results = [wasmtime::Val::I64(0)];
+        module
+            .call(&mut self.store, &args, &mut results)
+            .map_err(runtime)?;
+        match results[0] {
+            wasmtime::Val::I64(b) => Ok(b),
+            ref other => Err(ExprError::Runtime(format!("unexpected result {other:?}"))),
+        }
+    }
+}
+
+#[cfg(feature = "wasmtime")]
 fn runtime(e: impl std::fmt::Display) -> ExprError {
     ExprError::Runtime(e.to_string())
 }
