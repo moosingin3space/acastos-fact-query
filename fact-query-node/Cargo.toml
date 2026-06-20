@@ -1,0 +1,41 @@
+[package]
+name = "fact-query-node"
+version = "0.1.0"
+edition = "2024"
+authors = ["Nathan Moos <moosingin3space@gmail.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/moosingin3space/acastos-fact-query"
+description = "Node.js/TypeScript bindings for fact-query: parse, form-check, and bounded read-only conjunctive-query evaluation with provenance, evaluated in WebAssembly."
+readme = "README.md"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# `default-features = false` everywhere: no native `wasmtime`. The expression
+# tier runs on the host `WebAssembly` engine via `ascent-jit-web`'s executor.
+ascent-jit = { path = "../ascent-jit", default-features = false }
+fact-query = { path = "../fact-query", default-features = false }
+ascent-jit-web = { path = "../ascent-jit-web" }
+# Pinned exact so the generated glue matches the `wasm-bindgen` CLI used to build
+# (`wasm-bindgen --target nodejs`); a mismatch is a hard, confusing failure.
+wasm-bindgen = "=0.2.125"
+js-sys = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+
+[lints.rust]
+# Mirrors `ascent-jit-web`: `unsafe` is forbidden, every public item is
+# documented. (The full pedantic workspace lint set does not reach here because,
+# like `ascent-jit-web`, this crate is detached from the parent workspace.)
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[lints.clippy]
+all = { priority = -2, level = "deny" }
+pedantic = { priority = -1, level = "deny" }
+
+# Detached from the parent workspace: this crate is wasm32-only and is built
+# separately (`cargo build -p fact-query-node --target wasm32-unknown-unknown`),
+# mirroring how `ascent-jit-web` and `ascent-jit/fuzz` detach.
+[workspace]

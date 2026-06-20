@@ -8,9 +8,12 @@ members = [
 # - `ascent-jit/fuzz` needs nightly + libFuzzer (`cargo +nightly fuzz run`).
 # - `ascent-jit-web` is wasm32-only (`cargo build -p ascent-jit-web --target
 #   wasm32-unknown-unknown`); it pulls browser-only deps (js-sys/wasm-bindgen).
+# - `fact-query-node` is wasm32-only too (the Node.js/TypeScript binding); built
+#   via its own npm pipeline (`cd fact-query-node && npm run build`).
 exclude = [
     "ascent-jit/fuzz",
     "ascent-jit-web",
+    "fact-query-node",
 ]
 
 [workspace.package]

@@ -1,0 +1,39 @@
+{
+  "name": "@acastos/fact-query",
+  "version": "0.1.0",
+  "description": "Node.js/TypeScript bindings for fact-query: parse, form-check, and bounded read-only conjunctive-query evaluation with provenance, in WebAssembly.",
+  "license": "MIT OR Apache-2.0",
+  "author": "Nathan Moos <moosingin3space@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/moosingin3space/acastos-fact-query"
+  },
+  "keywords": [
+    "datalog",
+    "query",
+    "neurosymbolic",
+    "provenance",
+    "verifier",
+    "wasm"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/",
+    "wasm/",
+    "README.md"
+  ],
+  "scripts": {
+    "build:wasm": "cargo build --target wasm32-unknown-unknown --release && wasm-bindgen --target nodejs --out-dir wasm target/wasm32-unknown-unknown/release/fact_query_node.wasm",
+    "build:ts": "tsc",
+    "build": "npm run build:wasm && npm run build:ts",
+    "test": "npm run build && node --test",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

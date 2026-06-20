@@ -39,3 +39,14 @@ fuzz target="program" seconds="60":
 # Build the release artifacts for the whole workspace.
 build:
     cargo build --release --workspace
+
+# Build the Node.js/TypeScript binding (`fact-query-node`): wasm32 crate ->
+# wasm-bindgen glue -> tsc. Needs the wasm32 target and a matching
+# `wasm-bindgen-cli` (see the crate README). Detached from the workspace, so it
+# is not part of `just check`.
+node-build:
+    cd fact-query-node && npm install && npm run build
+
+# Build the Node.js binding and run its test suite.
+node-test:
+    cd fact-query-node && npm install && npm test

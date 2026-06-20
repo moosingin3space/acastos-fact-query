@@ -22,8 +22,15 @@ before any design change.
   `ascent-jit/fuzz`): a `WasmExecutor` over the browser's `WebAssembly` engine so
   queries evaluate in place in the page. Built separately:
   `cargo build -p ascent-jit-web --target wasm32-unknown-unknown`.
+- **`fact-query-node`** — a `wasm32`-only, workspace-*excluded* crate: the
+  Node.js/TypeScript binding. wasm-bindgen-exports a `FactEngine` over
+  `fact-query` (reusing `ascent-jit-web`'s `WebExecutor`), published as an npm
+  package with a hand-written TS wrapper. Built via its own npm pipeline
+  (`just node-build` / `cd fact-query-node && npm run build`), not `cargo`. See
+  [docs/0006](docs/0006-typescript-node-binding.md).
 
-`fact-query` and `ascent-jit-web` depend on `ascent-jit`. No crate depends on any
+`fact-query` and `ascent-jit-web` depend on `ascent-jit`; `fact-query-node`
+depends on `fact-query` and `ascent-jit-web`. No crate depends on any
 application.
 
 ## Invariants that are easy to violate

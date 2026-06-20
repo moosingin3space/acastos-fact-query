@@ -1,0 +1,7 @@
+# Rust build output.
+/target
+
+# Node build output and generated wasm-bindgen glue (rebuilt by `npm run build`).
+/node_modules
+/dist
+/wasm
