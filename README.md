@@ -108,6 +108,14 @@ const { rows, truncated, provenance } = engine.query(
 );
 ```
 
+## Learning to model data
+
+New to the engine? Start with [`tutorial/`](tutorial/) — a hands-on guide to
+shaping data into relations the engine can join, derive over, and explain. It
+teaches the one skill that matters (lowering structure into the closed value
+model) by fixing the most common mistake (hiding a list or record inside a single
+symbol).
+
 ## Design
 
 The reasoning behind these crates lives in [`docs/`](docs/):

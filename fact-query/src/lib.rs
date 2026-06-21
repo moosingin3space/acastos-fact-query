@@ -53,6 +53,16 @@ pub mod source;
 #[doc = include_str!("../README.md")]
 pub struct ReadmeDoctests;
 
+/// Compiles the `tutorial/` Rust snippets as doctests (under `cfg(doctest)`
+/// only), so the data-modeling guide cannot drift from the real engine and
+/// query API. See [`../../tutorial`](https://github.com/moosingin3space/acastos-fact-query/tree/main/tutorial).
+#[cfg(doctest)]
+#[doc = include_str!("../../tutorial/README.md")]
+#[doc = include_str!("../../tutorial/01-foundations.md")]
+#[doc = include_str!("../../tutorial/02-modeling-structure.md")]
+#[doc = include_str!("../../tutorial/03-collections-keys-grounding.md")]
+pub struct TutorialDoctests;
+
 pub use crate::error::FactQueryError;
 pub use crate::query::ConjunctiveQuery;
 pub use crate::result::{Justification, Provenance, ResultSet, RowProvenance, SupportTuple};
