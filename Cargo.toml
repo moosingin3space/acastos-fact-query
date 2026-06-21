@@ -22,7 +22,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/moosingin3space/acastos-fact-query"
-rust-version = "1.85"
+rust-version = "1.93.0"
 
 [workspace.lints.rust]
 warnings = "deny"
@@ -34,3 +34,6 @@ all = { priority = -2, level = "deny" }
 pedantic = { priority = -1, level = "deny" }
 mod_module_files = "deny"
 allow_attributes = "deny"
+
+[workspace.dependencies]
+ascent-jit = { path = "ascent-jit", version = "^0.1.0" } #unified

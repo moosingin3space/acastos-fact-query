@@ -34,17 +34,17 @@ jobs:
         run: just check
 
   msrv:
-    name: build on MSRV (1.85)
+    name: build on MSRV (1.93)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust 1.85
-        uses: dtolnay/rust-toolchain@1.85.0
+      - name: Install Rust 1.93
+        uses: dtolnay/rust-toolchain@1.93.0
 
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
 
-      # The workspace pins rust-version = 1.85; verify it still builds there.
+      # The workspace pins rust-version = 1.93; verify it still builds there.
       - name: Build
         run: cargo build --workspace --all-features

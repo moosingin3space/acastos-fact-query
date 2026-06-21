@@ -12,7 +12,7 @@ categories = ["data-structures", "database"]
 readme = "README.md"
 
 [dependencies]
-ascent-jit = { path = "../ascent-jit", version = "0.1.0", default-features = false }
+ascent-jit = { workspace = true } #unified
 
 [features]
 default = ["wasmtime"]
