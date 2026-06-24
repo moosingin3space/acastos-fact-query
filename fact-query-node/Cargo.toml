@@ -19,7 +19,7 @@ fact-query = { path = "../fact-query", default-features = false }
 ascent-jit-web = { path = "../ascent-jit-web" }
 # Pinned exact so the generated glue matches the `wasm-bindgen` CLI used to build
 # (`wasm-bindgen --target nodejs`); a mismatch is a hard, confusing failure.
-wasm-bindgen = "=0.2.125"
+wasm-bindgen = "=0.2.126"
 js-sys = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde-wasm-bindgen = "0.6"
