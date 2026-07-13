@@ -40,6 +40,14 @@ fuzz target="program" seconds="60":
 bench:
     cargo bench -p ascent-jit
 
+# Save the benchmarks as a named criterion baseline (criterion targets only: the lib harness rejects these flags).
+bench-save name:
+    cargo bench -p ascent-jit --bench joins --bench expr --bench queries -- --save-baseline {{name}}
+
+# Compare the benchmarks against a saved criterion baseline (criterion targets only: same reason as bench-save).
+bench-compare name:
+    cargo bench -p ascent-jit --bench joins --bench expr --bench queries -- --baseline {{name}}
+
 # Build the release artifacts for the whole workspace.
 build:
     cargo build --release --workspace
