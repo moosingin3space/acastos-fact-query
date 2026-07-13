@@ -1,0 +1,147 @@
+name: Bench
+
+# Benchmark tracking, kept in a separate workflow so criterion runs (minutes)
+# never gate the main CI check. On push to `main` we save a criterion baseline
+# into the Actions cache; on pull requests we restore the latest main baseline,
+# run criterion in comparison mode, and post a sticky diff comment.
+#
+# The Justfile is the source of truth: CI only shells out to `just` recipes.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+# Minimal by default; the commenting job widens its own scope below.
+permissions:
+  contents: read
+
+jobs:
+  # On push to main: run the benches and persist the baseline for PRs to diff.
+  save-baseline:
+    name: save main baseline
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # persist-credentials: false — nothing here pushes, and the token must not
+      # linger in .git/config while we compile and run benchmark code.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+
+      # Writes each benchmark's estimates into target/criterion/**/main/.
+      - name: Run benchmarks and save baseline
+        run: just bench-save main
+
+      # Persist the baseline under a commit-keyed key. PRs restore the most
+      # recent one via the `criterion-baseline-main-` restore-keys prefix.
+      # Caches created on the default branch are readable from PR branches, so
+      # this main -> PR direction works.
+      - name: Save baseline cache
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/criterion
+          key: criterion-baseline-main-${{ github.sha }}
+
+  # On pull requests: diff this branch against the latest main baseline.
+  compare:
+    name: compare against main
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Needed to post/update the sticky comment. Note: on PRs from forks the
+      # GITHUB_TOKEN is read-only regardless of this, so the comment step is
+      # gated to same-repo PRs and is best-effort (continue-on-error) elsewhere.
+      pull-requests: write
+    steps:
+      # persist-credentials: false — this job compiles and runs untrusted PR
+      # code; the checkout token must not linger in .git/config for it to read.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+
+      # Restore the most recent main baseline. The key never matches exactly (it
+      # carries the PR sha), so it always falls through to the restore-keys
+      # prefix and picks the latest main cache. A miss (first run / expired
+      # cache) simply leaves target/criterion absent — handled below.
+      - name: Restore main baseline cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/criterion
+          key: criterion-baseline-main-${{ github.sha }}
+          restore-keys: |
+            criterion-baseline-main-
+
+      # Did the restore actually bring back a usable `main` baseline?
+      - name: Detect baseline
+        id: detect
+        run: |
+          if [ -n "$(find target/criterion -path '*/main/estimates.json' -print -quit 2>/dev/null)" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Compare when a baseline exists; otherwise just run the benches so the
+      # job still succeeds (the comment will say no baseline was available).
+      - name: Run benchmarks
+        env:
+          BASELINE_AVAILABLE: ${{ steps.detect.outputs.available }}
+        run: |
+          if [ "$BASELINE_AVAILABLE" = "true" ]; then
+            just bench-compare main
+          else
+            just bench
+          fi
+
+      - name: Build comment body
+        run: python3 .github/scripts/criterion_compare.py --baseline main > bench-comment.md
+
+      # Best-effort: fork PRs get a read-only token, so guard on same-repo and
+      # never fail the job if commenting is not permitted.
+      - name: Post or update PR comment
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        uses: actions/github-script@d746ffe35508b1917358783b479e04febd2b8f71 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('bench-comment.md', 'utf8');
+            const marker = '<!-- criterion-bench -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number,
+            });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
