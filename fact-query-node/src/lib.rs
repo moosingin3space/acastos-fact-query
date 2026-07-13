@@ -130,16 +130,41 @@ pub struct FactEngine {
 
 #[wasm_bindgen]
 impl FactEngine {
-    /// Parses an Ascent program `src` and builds an engine over the host
-    /// `WebAssembly` engine.
+    /// Parses an Ascent program `src` and builds an engine over the chosen
+    /// expression evaluator.
+    ///
+    /// `evaluator` selects how `if` / `let` / head expressions are run:
+    ///
+    /// - `"wasm"` (the default when `evaluator` is absent) — the host's own
+    ///   `WebAssembly` engine, via [`ascent_jit_web`]'s `WebExecutor`. This
+    ///   nests a second `WebAssembly` instantiation inside the substrate wasm,
+    ///   with each expression call crossing the JS boundary (ADR 0006).
+    /// - `"interpreted"` — `ascent-jit`'s pure tree-walk interpreter, which runs
+    ///   in-substrate with no executor and no boundary crossing. Semantically
+    ///   identical (it is the differential oracle the wasm path is pinned to);
+    ///   it exists so callers can trade the boundary cost for interpretation
+    ///   cost when expressions dominate.
+    ///
+    /// Both paths evaluate the same queries grain and preserve the same
+    /// contract; only the expression tier differs.
     ///
     /// # Errors
     ///
-    /// Throws (stage `"engine"`) if `src` fails to parse or validate.
+    /// Throws (stage `"engine"`) if `src` fails to parse or validate, or if
+    /// `evaluator` is neither `"wasm"` nor `"interpreted"`.
     #[wasm_bindgen(js_name = fromSource)]
-    pub fn from_source(src: &str) -> Result<FactEngine, JsValue> {
-        let engine = ascent_jit_web::engine_from_source(src)
-            .map_err(|e| stage_error("engine", &e.to_string()))?;
+    pub fn from_source(src: &str, evaluator: Option<String>) -> Result<FactEngine, JsValue> {
+        let engine = match evaluator.as_deref().unwrap_or("wasm") {
+            "wasm" => ascent_jit_web::engine_from_source(src),
+            "interpreted" => Engine::from_source_interpreted(src),
+            other => {
+                return Err(stage_error(
+                    "engine",
+                    &format!("unknown evaluator `{other}`; expected \"wasm\" or \"interpreted\""),
+                ));
+            }
+        }
+        .map_err(|e| stage_error("engine", &e.to_string()))?;
         Ok(FactEngine { engine })
     }
 
