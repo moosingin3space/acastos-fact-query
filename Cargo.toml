@@ -36,4 +36,8 @@ mod_module_files = "deny"
 allow_attributes = "deny"
 
 [workspace.dependencies]
-ascent-jit = { path = "ascent-jit", version = "^0.1.0" } #unified
+# `default-features = false` so a `wasm32` consumer (e.g. `fact-query-node`
+# building `fact-query --no-default-features`) does not have `wasmtime` forced
+# into its graph by feature unification; native consumers get it back via
+# `fact-query`'s on-by-default `wasmtime` feature.
+ascent-jit = { path = "ascent-jit", version = "^0.1.0", default-features = false } #unified
