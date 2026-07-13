@@ -36,6 +36,10 @@ fuzz-quick ms="5000":
 fuzz target="program" seconds="60":
     cd ascent-jit && cargo +nightly fuzz run {{target}} -- -max_total_time={{seconds}}
 
+# Run the `ascent-jit` criterion benchmark suite (joins, expressions, queries).
+bench:
+    cargo bench -p ascent-jit
+
 # Build the release artifacts for the whole workspace.
 build:
     cargo build --release --workspace

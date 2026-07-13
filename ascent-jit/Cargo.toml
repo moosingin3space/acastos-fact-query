@@ -31,6 +31,19 @@ arbitrary = ["dep:arbitrary", "wasmtime"]
 [dev-dependencies]
 ascent = "0.8"
 arbtest = "0.3"
+criterion = "0.8"
+
+[[bench]]
+name = "joins"
+harness = false
+
+[[bench]]
+name = "expr"
+harness = false
+
+[[bench]]
+name = "queries"
+harness = false
 
 [lints]
 workspace = true
