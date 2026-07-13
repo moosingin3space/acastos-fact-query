@@ -91,6 +91,23 @@ underneath an LLM loop (e.g. the OpenRouter Agents SDK): the model proposes a
 query, you `check()` it cheaply, `query()` it under a bound, and show the
 `provenance` as the evidence a human or a vote signs off on.
 
+### Choosing the expression evaluator
+
+`fromSource` takes an optional second argument selecting how `if`/`let`/head
+expressions run — the relational core and all semantics are identical either
+way (the interpreter is the differential oracle the wasm path is pinned to):
+
+```ts
+const engine = FactEngine.fromSource(src, "interpreted");
+```
+
+- `"wasm"` (default) — a nested `WebAssembly` module via the host engine.
+  Every expression call crosses the JS boundary.
+- `"interpreted"` — a pure tree-walk, in-substrate, zero boundary crossings.
+  Measured faster under Node on every benchmarked workload (up to ~13× on
+  expression-heavy programs; see `npm run bench` and
+  [`docs/0008`](../docs/0008-benchmarks-and-the-join-jit-deferral.md)).
+
 ## The value model
 
 Every column is one of three kinds, mapped to disjoint JS types so a value is
