@@ -39,6 +39,22 @@ import { FactEngine as WasmFactEngine } from "../wasm/fact_query_node.js";
 export type ColumnType = "int" | "bool" | "sym";
 
 /**
+ * How an engine runs `if` / `let` / head expressions. Both evaluators share the
+ * relational core and are semantically identical (the interpreter is the
+ * differential oracle the wasm path is pinned to); they differ only in the
+ * expression tier.
+ *
+ * - `wasm` (the default) — the host's own `WebAssembly` engine, via the nested
+ *   `WebExecutor` (ADR 0004/0006). Each expression call crosses the JS
+ *   boundary (BigInt boxing, `Reflect.get`, `Function.apply`) into an inner
+ *   wasm module.
+ * - `interpreted` — a pure tree-walk of the expression IR, in-substrate, with
+ *   zero boundary crossings. Trades the boundary cost for interpretation cost;
+ *   faster where expressions dominate, otherwise a wash.
+ */
+export type Evaluator = "wasm" | "interpreted";
+
+/**
  * A column value as it leaves the engine. The three JS types are disjoint, so a
  * value is self-describing: a `bigint` is an integer (the engine's model is
  * `i64`, which `number` cannot hold losslessly), a `boolean` is a boolean, and a
@@ -238,11 +254,17 @@ export class FactEngine {
   /**
    * Parses an Ascent program and builds an engine.
    *
+   * @param src the Ascent program (relation declarations and rules).
+   * @param evaluator which expression tier to use (see {@link Evaluator}).
+   * Defaults to `"wasm"` — the current, contract-pinned behaviour. Pass
+   * `"interpreted"` to run expressions in-substrate with no JS-boundary
+   * crossing.
+   *
    * @throws {@link FactQueryError} (stage `engine`) if the source fails to parse
-   * or validate.
+   * or validate, or if `evaluator` is not a recognised value.
    */
-  static fromSource(src: string): FactEngine {
-    return new FactEngine(wrap(() => WasmFactEngine.fromSource(src)));
+  static fromSource(src: string, evaluator: Evaluator = "wasm"): FactEngine {
+    return new FactEngine(wrap(() => WasmFactEngine.fromSource(src, evaluator)));
   }
 
   /**
