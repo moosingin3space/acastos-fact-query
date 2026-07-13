@@ -66,7 +66,8 @@ application.
   just check          # fmt + clippy + test (--all-features) + doc
   ```
   Individual recipes: `just fmt`, `just clippy`, `just test`, `just doc`,
-  `just fuzz-quick [ms]`, `just fuzz <target> [seconds]`, `just build`.
+  `just bench`, `just fuzz-quick [ms]`, `just fuzz <target> [seconds]`,
+  `just build`.
 - Use `--all-features` when testing: the differential-fuzz suite
   (`tests/fuzz_diff.rs`) is gated behind the `arbitrary` feature and is a no-op
   without it.

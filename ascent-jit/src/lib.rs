@@ -303,8 +303,8 @@ impl Engine {
 
     /// Form-checks a query `body` against the loaded schema: every referenced
     /// relation exists and every atom matches its declared arity. (Range
-    /// restriction / safety is engine-agnostic and is the caller's, per ADR
-    /// 0008.) The outputs need no schema check — they are expressions over the
+    /// restriction / safety is engine-agnostic and is the caller's.) The
+    /// outputs need no schema check — they are expressions over the
     /// body's bound variables, not relation references.
     ///
     /// # Errors
