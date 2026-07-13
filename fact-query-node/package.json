@@ -28,6 +28,7 @@
     "build:ts": "tsc",
     "build": "npm run build:wasm && npm run build:ts",
     "test": "npm run build && node --test",
+    "bench": "npm run build && node bench/bench.cjs",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
