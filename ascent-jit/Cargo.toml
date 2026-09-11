@@ -12,7 +12,7 @@ categories = ["compilers", "data-structures"]
 readme = "../README.md"
 
 [dependencies]
-wasm-encoder = "0.253"
+wasm-encoder = "0.259"
 wasmtime = { version = "47", default-features = false, features = ["cranelift", "runtime"], optional = true }
 arbitrary = { version = "1.4", optional = true }
 

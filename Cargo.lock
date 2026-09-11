@@ -107,7 +107,7 @@ dependencies = [
  "arbtest",
  "ascent",
  "criterion",
- "wasm-encoder 0.253.0",
+ "wasm-encoder 0.259.0",
  "wasmtime",
 ]
 
@@ -1385,12 +1385,12 @@ dependencies = [
 
 [[package]]
 name = "wasm-encoder"
-version = "0.253.0"
+version = "0.259.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59972d6cd272259de647b7c1f1912e45e289c75ffd4be04e10695507cd7e1b59"
+checksum = "b1d0246511d901aacf25d2dc9111f0054947de5e093fe662099e709ff7530dc3"
 dependencies = [
  "leb128fmt",
- "wasmparser 0.253.0",
+ "wasmparser 0.259.0",
 ]
 
 [[package]]
@@ -1408,9 +1408,9 @@ dependencies = [
 
 [[package]]
 name = "wasmparser"
-version = "0.253.0"
+version = "0.259.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19db11f87d2486580e1e8b6f494c54df7e0566b87d0b599db843c24019667339"
+checksum = "0f7c12eac7bb587801590f6a67ff0bc84d0748513864b71108e4b311cc3df694"
 dependencies = [
  "bitflags",
  "indexmap",
