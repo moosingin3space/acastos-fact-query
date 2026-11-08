@@ -1,6 +1,6 @@
 # 0005: One WASM module, many entrypoints
 
-- **Status:** Proposed
+- **Status:** Superseded by [0010](0010-retire-the-wasm-expression-tier.md)
 - **Crate:** `ascent-jit` (with the `wasm32` consumer crate, `ascent-jit-web`)
 - **Builds on / amends:** [0004](0004-pluggable-wasm-execution.md) (the
   `WasmExecutor` seam). This record changes the seam's `call` signature and the

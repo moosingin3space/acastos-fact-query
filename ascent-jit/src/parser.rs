@@ -17,11 +17,12 @@
 //!             | "?" ("Dual" "(" ident ")" | ident)
 //! ```
 
-use crate::expr::{BinOp, Expr, UnOp};
+use crate::expr::{BinOp, Expr, MAX_EXPR_DEPTH, UnOp};
 use crate::ir::{
     AggFunc, Aggregate, Arg, Atom, BodyClause, HeadAtom, LatticeKind, Program, RelationDecl,
     RelationKind, Rule,
 };
+use crate::stack;
 use crate::value::{Interner, Type, Value};
 
 /// An error produced while parsing source text.
@@ -202,6 +203,7 @@ pub fn parse(src: &str, interner: &mut Interner) -> Result<Program, ParseError> 
         toks,
         pos: 0,
         interner,
+        nesting: 0,
     };
     p.program()
 }
@@ -228,6 +230,7 @@ pub fn parse_query(
         toks,
         pos: 0,
         interner,
+        nesting: 0,
     };
     let query = p.query()?;
     if p.peek().is_some() {
@@ -240,6 +243,8 @@ struct Parser<'a> {
     toks: Vec<Tok>,
     pos: usize,
     interner: &'a mut Interner,
+    /// Current syntactic nesting depth of the expression being parsed.
+    nesting: usize,
 }
 
 impl Parser<'_> {
@@ -513,32 +518,57 @@ impl Parser<'_> {
     }
 
     // ----- expressions -----
+    //
+    // Each level returns its subtree's depth alongside it, and every node is
+    // built through `unary`/`binary`, which enforce `MAX_EXPR_DEPTH`. A tree
+    // too deep to evaluate is therefore never even built: a flat chain like
+    // `1 + 1 + ...` parses in a loop, so recursion depth alone would not catch
+    // it, and dropping a pathologically deep tree would itself recurse.
+    // Recursion through parentheses, `Dual(..)`, and prefix operators is bounded
+    // separately by `nested`.
 
+    /// A complete expression (a head argument, condition, `let`, aggregate
+    /// argument, or query output).
     fn expr(&mut self) -> Result<Expr, ParseError> {
-        self.expr_or()
+        Ok(self.expr_or()?.0)
     }
 
-    fn expr_or(&mut self) -> Result<Expr, ParseError> {
+    /// Runs `f` one syntactic nesting level deeper, failing past the limit and
+    /// growing the stack on demand.
+    fn nested<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        if self.nesting >= MAX_EXPR_DEPTH {
+            return too_deep();
+        }
+        self.nesting += 1;
+        let out = stack::guard(|| f(self));
+        self.nesting -= 1;
+        out
+    }
+
+    fn expr_or(&mut self) -> Result<Node, ParseError> {
         let mut lhs = self.expr_and()?;
         while matches!(self.peek(), Some(Tok::OrOr)) {
             self.next()?;
             let rhs = self.expr_and()?;
-            lhs = Expr::Binary(BinOp::Or, Box::new(lhs), Box::new(rhs));
+            lhs = binary(BinOp::Or, lhs, rhs)?;
         }
         Ok(lhs)
     }
 
-    fn expr_and(&mut self) -> Result<Expr, ParseError> {
+    fn expr_and(&mut self) -> Result<Node, ParseError> {
         let mut lhs = self.expr_cmp()?;
         while matches!(self.peek(), Some(Tok::AndAnd)) {
             self.next()?;
             let rhs = self.expr_cmp()?;
-            lhs = Expr::Binary(BinOp::And, Box::new(lhs), Box::new(rhs));
+            lhs = binary(BinOp::And, lhs, rhs)?;
         }
         Ok(lhs)
     }
 
-    fn expr_cmp(&mut self) -> Result<Expr, ParseError> {
+    fn expr_cmp(&mut self) -> Result<Node, ParseError> {
         let lhs = self.expr_add()?;
         let op = match self.peek() {
             Some(Tok::EqEq) => BinOp::Eq,
@@ -551,10 +581,10 @@ impl Parser<'_> {
         };
         self.next()?;
         let rhs = self.expr_add()?;
-        Ok(Expr::Binary(op, Box::new(lhs), Box::new(rhs)))
+        binary(op, lhs, rhs)
     }
 
-    fn expr_add(&mut self) -> Result<Expr, ParseError> {
+    fn expr_add(&mut self) -> Result<Node, ParseError> {
         let mut lhs = self.expr_mul()?;
         loop {
             let op = match self.peek() {
@@ -564,12 +594,12 @@ impl Parser<'_> {
             };
             self.next()?;
             let rhs = self.expr_mul()?;
-            lhs = Expr::Binary(op, Box::new(lhs), Box::new(rhs));
+            lhs = binary(op, lhs, rhs)?;
         }
         Ok(lhs)
     }
 
-    fn expr_mul(&mut self) -> Result<Expr, ParseError> {
+    fn expr_mul(&mut self) -> Result<Node, ParseError> {
         let mut lhs = self.expr_cast()?;
         loop {
             let op = match self.peek() {
@@ -580,12 +610,12 @@ impl Parser<'_> {
             };
             self.next()?;
             let rhs = self.expr_cast()?;
-            lhs = Expr::Binary(op, Box::new(lhs), Box::new(rhs));
+            lhs = binary(op, lhs, rhs)?;
         }
         Ok(lhs)
     }
 
-    fn expr_cast(&mut self) -> Result<Expr, ParseError> {
+    fn expr_cast(&mut self) -> Result<Node, ParseError> {
         let inner = self.expr_unary()?;
         // `expr as type` is accepted and ignored: our value model is untyped
         // across integer widths, so casts between integer types are identities.
@@ -597,43 +627,68 @@ impl Parser<'_> {
         Ok(inner)
     }
 
-    fn expr_unary(&mut self) -> Result<Expr, ParseError> {
-        match self.peek() {
-            Some(Tok::Minus) => {
-                self.next()?;
-                Ok(Expr::Unary(UnOp::Neg, Box::new(self.expr_unary()?)))
-            }
-            Some(Tok::Bang) => {
-                self.next()?;
-                Ok(Expr::Unary(UnOp::Not, Box::new(self.expr_unary()?)))
-            }
-            _ => self.expr_primary(),
-        }
+    fn expr_unary(&mut self) -> Result<Node, ParseError> {
+        let op = match self.peek() {
+            Some(Tok::Minus) => UnOp::Neg,
+            Some(Tok::Bang) => UnOp::Not,
+            _ => return self.expr_primary(),
+        };
+        self.next()?;
+        let operand = self.nested(Self::expr_unary)?;
+        unary(op, operand)
     }
 
-    fn expr_primary(&mut self) -> Result<Expr, ParseError> {
+    fn expr_primary(&mut self) -> Result<Node, ParseError> {
         match self.next()? {
             Tok::LParen => {
-                let e = self.expr()?;
+                let e = self.nested(Self::expr_or)?;
                 self.eat(&Tok::RParen)?;
                 Ok(e)
             }
-            Tok::Int(n) => Ok(Expr::Lit(Value::Int(n))),
-            Tok::Str(s) => Ok(Expr::Lit(Value::Sym(self.interner.intern(&s)))),
+            Tok::Int(n) => Ok(leaf(Expr::Lit(Value::Int(n)))),
+            Tok::Str(s) => Ok(leaf(Expr::Lit(Value::Sym(self.interner.intern(&s))))),
             Tok::Ident(s) => match s.as_str() {
-                "true" => Ok(Expr::Lit(Value::Bool(true))),
-                "false" => Ok(Expr::Lit(Value::Bool(false))),
+                "true" => Ok(leaf(Expr::Lit(Value::Bool(true)))),
+                "false" => Ok(leaf(Expr::Lit(Value::Bool(false)))),
                 // `Dual(expr)` in a head is a lattice constructor; the relation
                 // declaration already records the ordering, so we unwrap it.
                 "Dual" => {
                     self.eat(&Tok::LParen)?;
-                    let e = self.expr()?;
+                    let e = self.nested(Self::expr_or)?;
                     self.eat(&Tok::RParen)?;
                     Ok(e)
                 }
-                _ => Ok(Expr::Var(self.interner.intern(&s))),
+                _ => Ok(leaf(Expr::Var(self.interner.intern(&s)))),
             },
             other => err(format!("unexpected token in expression: {other:?}")),
         }
     }
+}
+
+/// An expression paired with its tree depth (see [`MAX_EXPR_DEPTH`]).
+type Node = (Expr, usize);
+
+fn leaf(e: Expr) -> Node {
+    (e, 1)
+}
+
+fn too_deep<T>() -> Result<T, ParseError> {
+    err(format!(
+        "expression nested deeper than {MAX_EXPR_DEPTH} levels"
+    ))
+}
+
+fn unary(op: UnOp, (e, d): Node) -> Result<Node, ParseError> {
+    if d >= MAX_EXPR_DEPTH {
+        return too_deep();
+    }
+    Ok((Expr::Unary(op, Box::new(e)), d + 1))
+}
+
+fn binary(op: BinOp, (a, da): Node, (b, db): Node) -> Result<Node, ParseError> {
+    let d = da.max(db);
+    if d >= MAX_EXPR_DEPTH {
+        return too_deep();
+    }
+    Ok((Expr::Binary(op, Box::new(a), Box::new(b)), d + 1))
 }

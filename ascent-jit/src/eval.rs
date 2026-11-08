@@ -2,10 +2,9 @@
 //! loop over a relational database.
 //!
 //! The relational core is an interpreter (a nested-loop walk of the rule
-//! bodies); expression evaluation is delegated to an [`ExprEval`] so the same
-//! evaluator runs over either the pure interpreter ([`crate::expr`]) or the WASM
-//! tier ([`crate::wasm`]). See [`run`] for the evaluation strategy and ADR 0009
-//! for why it is shaped this way.
+//! bodies); `if`/`let`/head expressions are evaluated by [`Expr::eval`]. See
+//! [`run`] for the evaluation strategy and ADR 0009 for why it is shaped this
+//! way.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -15,33 +14,8 @@ use crate::ir::{
     AggFunc, Aggregate, Arg, Atom, BodyClause, HeadAtom, LatticeKind, Program, RelationDecl,
     RelationKind, Rule,
 };
+use crate::stack;
 use crate::value::{Symbol, Type, Value};
-
-/// Evaluates expressions on behalf of the relational interpreter.
-pub trait ExprEval: std::fmt::Debug {
-    /// Evaluates `expr` under the variable bindings `env`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an [`ExprError`] if evaluation fails (e.g. unbound variable).
-    fn eval_expr(&mut self, expr: &Expr, env: &HashMap<Symbol, Value>) -> Result<Value, ExprError>;
-
-    /// Pre-registers a batch of expressions known ahead of time, so a backend
-    /// that compiles can prepare them up front rather than on first evaluation.
-    /// The default is a no-op (e.g. the pure interpreter needs no preparation);
-    /// the WASM backend builds its single module here (see ADR 0005). Passing an
-    /// expression not primed here is still valid — [`ExprEval::eval_expr`]
-    /// prepares it on demand.
-    ///
-    /// # Errors
-    ///
-    /// Returns an [`ExprError`] if preparation fails (e.g. the WASM module fails
-    /// to compile or instantiate).
-    fn prime(&mut self, exprs: &[&Expr]) -> Result<(), ExprError> {
-        let _ = exprs;
-        Ok(())
-    }
-}
 
 /// An error raised during program validation or evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -757,7 +731,6 @@ trait Sink {
     /// Called once per satisfying assignment, with the matched positive rows.
     fn emit(
         &mut self,
-        evaluator: &mut dyn ExprEval,
         db: &Database,
         env: &Env,
         support: &[(usize, RowId)],
@@ -770,7 +743,6 @@ trait Sink {
 struct Walk<'a> {
     db: &'a Database,
     locals: &'a [(usize, Index)],
-    evaluator: &'a mut dyn ExprEval,
 }
 
 impl<'a> Walk<'a> {
@@ -802,7 +774,22 @@ impl<'a> Walk<'a> {
 
     /// Solves `steps[idx..]`. `windows[i]` is the row range positive step `i`
     /// may read (the semi-naïve delta discipline); other steps read everything.
+    ///
+    /// Recursion depth is the body's clause count, which nothing bounds, so
+    /// each level runs under [`stack::guard`].
     fn walk<S: Sink>(
+        &mut self,
+        steps: &[Step<'_>],
+        windows: &[Range<RowId>],
+        idx: usize,
+        env: &mut Env,
+        support: &mut Vec<(usize, RowId)>,
+        sink: &mut S,
+    ) -> Result<(), EvalError> {
+        stack::guard(|| self.walk_step(steps, windows, idx, env, support, sink))
+    }
+
+    fn walk_step<S: Sink>(
         &mut self,
         steps: &[Step<'_>],
         windows: &[Range<RowId>],
@@ -815,7 +802,7 @@ impl<'a> Walk<'a> {
             return Ok(());
         }
         let Some(step) = steps.get(idx) else {
-            return sink.emit(&mut *self.evaluator, self.db, env, support);
+            return sink.emit(self.db, env, support);
         };
         match step {
             Step::Positive { atom, probe } => {
@@ -847,13 +834,13 @@ impl<'a> Walk<'a> {
                 Ok(())
             }
             Step::Condition(expr) => {
-                if self.evaluator.eval_expr(expr, env)? == Value::Bool(true) {
+                if expr.eval(env)? == Value::Bool(true) {
                     self.walk(steps, windows, idx + 1, env, support, sink)?;
                 }
                 Ok(())
             }
             Step::Let { var, expr } => {
-                let v = self.evaluator.eval_expr(expr, env)?;
+                let v = expr.eval(env)?;
                 env.insert(*var, v);
                 self.walk(steps, windows, idx + 1, env, support, sink)?;
                 env.remove(var);
@@ -888,7 +875,7 @@ impl<'a> Walk<'a> {
             if let Some(arg) = &agg.arg {
                 let mut local = env.clone();
                 local.extend(bindings);
-                values.push(self.evaluator.eval_expr(arg, &local)?);
+                values.push(arg.eval(&local)?);
             }
         }
         let ints = || values.iter().map(value_as_int);
@@ -1050,7 +1037,6 @@ impl<'h> Derive<'h> {
 impl Sink for Derive<'_> {
     fn emit(
         &mut self,
-        evaluator: &mut dyn ExprEval,
         db: &Database,
         env: &Env,
         _support: &[(usize, RowId)],
@@ -1059,7 +1045,7 @@ impl Sink for Derive<'_> {
             let tuple = head
                 .args
                 .iter()
-                .map(|arg| evaluator.eval_expr(arg, env))
+                .map(|arg| arg.eval(env))
                 .collect::<Result<Vec<_>, _>>()?;
             if !db.relations[rel].contains(&tuple) && self.seen.insert((rel, tuple.clone())) {
                 self.pending.push((rel, tuple));
@@ -1069,7 +1055,7 @@ impl Sink for Derive<'_> {
     }
 }
 
-/// Runs `program` to a fixed point over `db`, using `evaluator` for expressions.
+/// Runs `program` to a fixed point over `db`.
 ///
 /// Evaluation is **semi-naïve** and **indexed**. Each stratum iterates to a
 /// fixed point, but an iteration only joins against the tuples derived by the
@@ -1091,11 +1077,7 @@ impl Sink for Derive<'_> {
 /// Returns [`EvalError`] on stratification failure or any evaluation error,
 /// including [`EvalError::IterationLimit`] — which is indeterminate, never "no
 /// more derivations".
-pub fn run(
-    program: &Program,
-    db: &mut Database,
-    evaluator: &mut dyn ExprEval,
-) -> Result<(), EvalError> {
+pub fn run(program: &Program, db: &mut Database) -> Result<(), EvalError> {
     let strata = stratify(program)?;
     let plans = plan_rules(program, db)?;
     let fresh = !db.at_fixpoint;
@@ -1105,7 +1087,7 @@ pub fn run(
         db.relations.iter().map(|s| s.closed).collect()
     };
     for group in &strata {
-        run_stratum(group, &plans, db, evaluator, &base, fresh)?;
+        run_stratum(group, &plans, db, &base, fresh)?;
     }
     for store in &mut db.relations {
         store.closed = store.len();
@@ -1123,7 +1105,6 @@ fn run_stratum(
     group: &[usize],
     plans: &[RulePlan<'_>],
     db: &mut Database,
-    evaluator: &mut dyn ExprEval,
     base: &[RowId],
     fresh: bool,
 ) -> Result<(), EvalError> {
@@ -1137,7 +1118,7 @@ fn run_stratum(
             return Ok(());
         }
         for &rule in group {
-            fire(&plans[rule], db, evaluator, &lo, &hi, first && fresh)?;
+            fire(&plans[rule], db, &lo, &hi, first && fresh)?;
         }
         if !first {
             iterations += 1;
@@ -1154,7 +1135,6 @@ fn run_stratum(
 fn fire(
     plan: &RulePlan<'_>,
     db: &mut Database,
-    evaluator: &mut dyn ExprEval,
     lo: &[RowId],
     hi: &[RowId],
     from_scratch: bool,
@@ -1166,7 +1146,6 @@ fn fire(
         let mut walk = Walk {
             db: &*db,
             locals: &[],
-            evaluator,
         };
         let mut windows = vec![0..0; plan.steps.len()];
         let mut env = Env::new();
@@ -1203,11 +1182,7 @@ fn fire(
 /// against: every rule re-fired over the whole database, with no indexes,
 /// until nothing changes. Never marks a fixed point, so each call starts over.
 #[cfg(feature = "arbitrary")]
-pub(crate) fn run_naive(
-    program: &Program,
-    db: &mut Database,
-    evaluator: &mut dyn ExprEval,
-) -> Result<(), EvalError> {
+pub(crate) fn run_naive(program: &Program, db: &mut Database) -> Result<(), EvalError> {
     let strata = stratify(program)?;
     let plans = program
         .rules
@@ -1221,7 +1196,7 @@ pub(crate) fn run_naive(
             for &rule in group {
                 let zeros = vec![0; db.relations.len()];
                 let hi = db.lens();
-                changed |= fire(&plans[rule], db, evaluator, &zeros, &hi, true)?;
+                changed |= fire(&plans[rule], db, &zeros, &hi, true)?;
             }
             if !changed {
                 break;
@@ -1262,7 +1237,6 @@ struct Explain<'t> {
 impl Sink for Explain<'_> {
     fn emit(
         &mut self,
-        evaluator: &mut dyn ExprEval,
         db: &Database,
         env: &Env,
         support: &[(usize, RowId)],
@@ -1274,7 +1248,7 @@ impl Sink for Explain<'_> {
             let tuple = head
                 .args
                 .iter()
-                .map(|arg| evaluator.eval_expr(arg, env))
+                .map(|arg| arg.eval(env))
                 .collect::<Result<Vec<_>, _>>()?;
             let matches = if self.is_lattice {
                 tuple.len() == self.target.len()
@@ -1311,7 +1285,6 @@ impl Sink for Explain<'_> {
 pub fn explain(
     program: &Program,
     db: &Database,
-    evaluator: &mut dyn ExprEval,
     relation: &str,
     tuple: &[Value],
 ) -> Result<Vec<Derivation>, EvalError> {
@@ -1342,7 +1315,6 @@ pub fn explain(
         Walk {
             db,
             locals: &locals,
-            evaluator: &mut *evaluator,
         }
         .walk(
             &steps,
@@ -1399,7 +1371,6 @@ impl Sink for Collect<'_> {
 
     fn emit(
         &mut self,
-        evaluator: &mut dyn ExprEval,
         db: &Database,
         env: &Env,
         support: &[(usize, RowId)],
@@ -1411,7 +1382,7 @@ impl Sink for Collect<'_> {
         let tuple = self
             .outputs
             .iter()
-            .map(|expr| evaluator.eval_expr(expr, env))
+            .map(|expr| expr.eval(env))
             .collect::<Result<Vec<_>, _>>()?;
         self.out.push(QuerySolution {
             tuple,
@@ -1445,7 +1416,6 @@ impl Sink for Collect<'_> {
 /// expected to have run a range-restriction check first).
 pub fn eval_query(
     db: &Database,
-    evaluator: &mut dyn ExprEval,
     outputs: &[Expr],
     body: &[BodyClause],
     max: usize,
@@ -1463,7 +1433,6 @@ pub fn eval_query(
     Walk {
         db,
         locals: &locals,
-        evaluator,
     }
     .walk(
         &steps,

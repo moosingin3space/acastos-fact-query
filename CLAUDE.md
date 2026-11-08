@@ -6,31 +6,26 @@ before any design change.
 
 ## The crates
 
-- **`ascent-jit`** — a runtime interpreter for Ascent programs supplied as data.
-  The relational core is an interpreter (a tree-walk of a relational IR with a
-  stratified, semi-naïve fixed-point loop); `if`/`let`/head expressions are
-  lowered to WebAssembly and run through a swappable `WasmExecutor`. The default
-  executor (`WasmtimeExecutor`, behind the on-by-default `wasmtime` feature)
-  JIT-compiles under `wasmtime`; encoding is shared and runtime-free, so the
-  crate also builds `--no-default-features` for `wasm32`. Provides query,
-  provenance (`explain`), and speculative (`fork / assert / run / discard`)
-  evaluation. See [docs/0004](docs/0004-pluggable-wasm-execution.md).
+- **`ascent-jit`** — a runtime interpreter for Ascent programs supplied as data:
+  a stratified, semi-naïve, indexed, incremental fixed-point loop over a
+  relational IR ([docs/0009](docs/0009-semi-naive-indexed-evaluation.md)), with
+  `if`/`let`/head expressions evaluated by a pure tree-walk (`Expr::eval`). There
+  is no WebAssembly tier any more (the name is historical; see
+  [docs/0010](docs/0010-retire-the-wasm-expression-tier.md)), so the crate
+  builds for `wasm32` as-is. Provides query, provenance (`explain`), and
+  speculative (`fork / assert / run / discard`) evaluation.
 - **`fact-query`** — a governance-free proposer/verifier substrate over an
   `ascent-jit` fact base. The `FactStore` trait is the query seam; `FactSource`
   is the produce seam. v1 ships the conjunctive **queries grain** only.
-- **`ascent-jit-web`** — a `wasm32`-only, workspace-*excluded* crate (like
-  `ascent-jit/fuzz`): a `WasmExecutor` over the browser's `WebAssembly` engine so
-  queries evaluate in place in the page. Built separately:
-  `cargo build -p ascent-jit-web --target wasm32-unknown-unknown`.
 - **`fact-query-node`** — a `wasm32`-only, workspace-*excluded* crate: the
   Node.js/TypeScript binding. wasm-bindgen-exports a `FactEngine` over
-  `fact-query` (reusing `ascent-jit-web`'s `WebExecutor`), published as an npm
+  `fact-query` (the interpreter runs in-substrate), published as an npm
   package with a hand-written TS wrapper. Built via its own npm pipeline
   (`just node-build` / `cd fact-query-node && npm run build`), not `cargo`. See
   [docs/0006](docs/0006-typescript-node-binding.md).
 
-`fact-query` and `ascent-jit-web` depend on `ascent-jit`; `fact-query-node`
-depends on `fact-query` and `ascent-jit-web`. No crate depends on any
+`fact-query` depends on `ascent-jit`; `fact-query-node` depends on `fact-query`
+and `ascent-jit`. No crate depends on any
 application.
 
 ## Invariants that are easy to violate
@@ -48,7 +43,7 @@ application.
   is an error, never silently "nothing derived" / "no violations." A
   safety-conscious caller must treat it as a denial.
 - **The value model is closed and `Copy`.** `Value` is `{Int(i64) | Bool | Sym}`.
-  Hashing, the WASM bit-bridge, and the differential oracle all rest on this.
+  Hashing, indexing, and the differential oracles all rest on this.
   Don't widen it; lower rich external data to these three kinds (see
   [docs/0003](docs/0003-external-fact-sources.md)).
 - **The query contract checks form, not meaning.** `eval` returns a `ResultSet`,

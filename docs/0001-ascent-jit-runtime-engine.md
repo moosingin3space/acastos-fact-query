@@ -1,6 +1,10 @@
 # 0001: A runtime interpreter for Ascent
 
 - **Status:** Accepted
+- **Revised by:** [0009](0009-semi-naive-indexed-evaluation.md) (the core is now
+  semi-naïve and indexed, as this record intended) and
+  [0010](0010-retire-the-wasm-expression-tier.md) (item 6, the WebAssembly
+  expression sandbox, is retired; the interpreter is the only backend)
 - **Crate:** `ascent-jit`
 
 ## Context

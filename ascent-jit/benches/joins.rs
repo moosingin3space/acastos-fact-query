@@ -1,11 +1,10 @@
 //! Q1 — join scaling / relational-core cost.
 //!
 //! Transitive closure (`path(x, z) <-- edge(x, y), path(y, z)` plus the base
-//! rule) over a chain graph of `n` edges, timed at several sizes. Three engines
-//! run on identical inputs: the wasmtime expression tier, the pure interpreter
-//! tier, and the monomorphized `ascent!` macro as the baseline. Only the
-//! fixed-point run is timed; engine construction, fact loading, and (for the
-//! wasm tier) module compilation happen in the untimed setup, so the numbers
+//! rule) over a chain graph of `n` edges, timed at several sizes. Two engines run
+//! on identical inputs: the `ascent-jit` interpreter and the monomorphized
+//! `ascent!` macro as the baseline. Only the fixed-point run is timed; engine
+//! construction and fact loading happen in the untimed setup, so the numbers
 //! isolate the relational core's join cost and its scaling curve.
 
 use std::hint::black_box;
@@ -41,12 +40,9 @@ fn chain(n: i64) -> Vec<(i64, i64)> {
     (0..n).map(|i| (i, i + 1)).collect()
 }
 
-/// Builds a loaded-but-not-run engine over the given expression backend.
-fn load_engine(
-    build: fn(&str) -> Result<Engine, ascent_jit::Error>,
-    edges: &[(i64, i64)],
-) -> Engine {
-    let mut engine = build(SRC).expect("program loads");
+/// Builds a loaded-but-not-run engine.
+fn load_engine(edges: &[(i64, i64)]) -> Engine {
+    let mut engine = Engine::from_source(SRC).expect("program loads");
     for &(a, b) in edges {
         engine
             .add_fact("edge", vec![Value::Int(a), Value::Int(b)])
@@ -64,20 +60,9 @@ fn bench_joins(c: &mut Criterion) {
     for n in SIZES {
         let edges = chain(n);
 
-        group.bench_with_input(BenchmarkId::new("wasmtime", n), &edges, |b, edges| {
-            b.iter_batched(
-                || load_engine(Engine::from_source, edges),
-                |mut engine| {
-                    engine.run().expect("run reaches a fixed point");
-                    black_box(engine.query("path").len())
-                },
-                BatchSize::PerIteration,
-            );
-        });
-
         group.bench_with_input(BenchmarkId::new("interpreted", n), &edges, |b, edges| {
             b.iter_batched(
-                || load_engine(Engine::from_source_interpreted, edges),
+                || load_engine(edges),
                 |mut engine| {
                     engine.run().expect("run reaches a fixed point");
                     black_box(engine.query("path").len())

@@ -24,7 +24,7 @@ fn closure_engine() -> Engine {
 /// edge(1,2) as its sole support.
 #[test]
 fn explains_a_base_rule_derivation() {
-    let mut engine = closure_engine();
+    let engine = closure_engine();
     let derivations = engine.explain("path", &[int(1), int(2)]).unwrap();
 
     assert!(
@@ -39,7 +39,7 @@ fn explains_a_base_rule_derivation() {
 /// (index 1) supported by edge(1,2) and path(2,3).
 #[test]
 fn explains_a_recursive_derivation() {
-    let mut engine = closure_engine();
+    let engine = closure_engine();
     let derivations = engine.explain("path", &[int(1), int(3)]).unwrap();
 
     let recursive = derivations
@@ -65,7 +65,7 @@ fn explains_a_recursive_derivation() {
 /// A tuple that is not derivable yields no derivations rather than an error.
 #[test]
 fn unprovable_tuple_has_no_derivations() {
-    let mut engine = closure_engine();
+    let engine = closure_engine();
     assert!(
         engine
             .explain("path", &[int(9), int(9)])
@@ -77,6 +77,6 @@ fn unprovable_tuple_has_no_derivations() {
 /// Explaining an unknown relation is an error.
 #[test]
 fn explain_rejects_unknown_relation() {
-    let mut engine = closure_engine();
+    let engine = closure_engine();
     assert!(engine.explain("nope", &[int(1)]).is_err());
 }

@@ -2,11 +2,11 @@
 //!
 //! Expressions have a small, total, side-effect-free semantics. This module
 //! provides the IR ([`Expr`]), a type inferencer, and a tree-walking
-//! interpreter. The interpreter is the differential oracle for the WASM tier
-//! in [`crate::wasm`]: both must agree on every input.
+//! interpreter — the only expression backend (ADR 0010).
 
 use std::collections::HashMap;
 
+use crate::stack;
 use crate::value::{Symbol, Type, Value};
 
 /// A unary operator.
@@ -66,6 +66,17 @@ impl BinOp {
     }
 }
 
+/// The maximum nesting depth of an expression tree: a literal or variable has
+/// depth 1, and each operator adds one level above its deepest operand.
+///
+/// The parser rejects deeper expressions, and [`Expr::eval`] / [`Expr::infer`]
+/// fail with [`ExprError::DepthLimit`] on hand-built ones, so every walk over an
+/// expression has bounded recursion. On native targets those walks also grow
+/// the stack on demand (`stacker`); on `wasm32` this limit is the only guard.
+/// Real rule expressions are a handful of levels deep; 256 leaves ample room
+/// while keeping the worst case far inside a default stack.
+pub const MAX_EXPR_DEPTH: usize = 256;
+
 /// An expression over bound variables.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Expr {
@@ -86,12 +97,12 @@ pub enum ExprError {
     UnboundVar(Symbol),
     /// An operator was applied to operands of the wrong type.
     TypeMismatch(String),
-    /// An arithmetic fault: division by zero or signed overflow. Both the
-    /// interpreter and the WASM tier surface this (WASM as a trap), so the two
-    /// agree instead of one panicking and the other trapping.
+    /// An arithmetic fault: division by zero or signed overflow. Surfaced as
+    /// an error rather than a panic, with the same conditions as the `ascent!`
+    /// macro's checked arithmetic.
     Arithmetic(&'static str),
-    /// A runtime failure in the WASM tier (trap, fuel exhaustion, or codegen).
-    Runtime(String),
+    /// The expression is nested deeper than [`MAX_EXPR_DEPTH`].
+    DepthLimit,
 }
 
 impl std::fmt::Display for ExprError {
@@ -100,7 +111,9 @@ impl std::fmt::Display for ExprError {
             ExprError::UnboundVar(s) => write!(f, "unbound variable {}", s.0),
             ExprError::TypeMismatch(m) => write!(f, "type mismatch: {m}"),
             ExprError::Arithmetic(m) => write!(f, "arithmetic fault: {m}"),
-            ExprError::Runtime(m) => write!(f, "runtime error: {m}"),
+            ExprError::DepthLimit => {
+                write!(f, "expression nested deeper than {MAX_EXPR_DEPTH} levels")
+            }
         }
     }
 }
@@ -132,14 +145,22 @@ impl Expr {
     /// Returns [`ExprError`] if a variable is unbound or an operator is applied
     /// to incompatible operand types.
     pub fn infer(&self, env: &HashMap<Symbol, Type>) -> Result<Type, ExprError> {
+        self.infer_at(env, 1)
+    }
+
+    fn infer_at(&self, env: &HashMap<Symbol, Type>, depth: usize) -> Result<Type, ExprError> {
+        if depth > MAX_EXPR_DEPTH {
+            return Err(ExprError::DepthLimit);
+        }
+        let next = depth + 1;
         match self {
             Expr::Var(s) => env.get(s).copied().ok_or(ExprError::UnboundVar(*s)),
             Expr::Lit(v) => Ok(v.type_of()),
-            Expr::Unary(UnOp::Neg, e) => expect_type(e, env, Type::Int).map(|()| Type::Int),
-            Expr::Unary(UnOp::Not, e) => expect_type(e, env, Type::Bool).map(|()| Type::Bool),
+            Expr::Unary(UnOp::Neg, e) => expect_type(e, env, Type::Int, next).map(|()| Type::Int),
+            Expr::Unary(UnOp::Not, e) => expect_type(e, env, Type::Bool, next).map(|()| Type::Bool),
             Expr::Binary(op, a, b) => {
-                let ta = a.infer(env)?;
-                let tb = b.infer(env)?;
+                let ta = stack::guard(|| a.infer_at(env, next))?;
+                let tb = stack::guard(|| b.infer_at(env, next))?;
                 if op.is_logical() {
                     require(
                         ta == Type::Bool && tb == Type::Bool,
@@ -163,38 +184,76 @@ impl Expr {
 
     /// Evaluates this expression under `env`.
     ///
-    /// This interpreter is the oracle the WASM tier is differentially tested
-    /// against; the two must agree for every input.
-    ///
     /// # Errors
     ///
     /// Returns [`ExprError`] if a variable is unbound or a type rule is broken.
     pub fn eval(&self, env: &HashMap<Symbol, Value>) -> Result<Value, ExprError> {
+        self.eval_at(env, 1)
+    }
+
+    /// The tree depth of this expression (see [`MAX_EXPR_DEPTH`]), computed
+    /// iteratively so it is safe on an arbitrarily deep, hand-built tree.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        let mut deepest = 0;
+        let mut stack = vec![(self, 1_usize)];
+        while let Some((e, d)) = stack.pop() {
+            deepest = deepest.max(d);
+            match e {
+                Expr::Var(_) | Expr::Lit(_) => {}
+                Expr::Unary(_, a) => stack.push((a, d + 1)),
+                Expr::Binary(_, a, b) => {
+                    stack.push((a, d + 1));
+                    stack.push((b, d + 1));
+                }
+            }
+        }
+        deepest
+    }
+
+    /// [`Expr::eval`] at nesting `depth`. Only every 16th level checks the
+    /// stack: a guard costs a few nanoseconds and this is the hot path, while
+    /// sixteen frames are far inside the guard's red zone.
+    fn eval_at(&self, env: &HashMap<Symbol, Value>, depth: usize) -> Result<Value, ExprError> {
+        if depth > MAX_EXPR_DEPTH {
+            return Err(ExprError::DepthLimit);
+        }
+        if depth.is_multiple_of(16) {
+            stack::guard(|| self.eval_node(env, depth))
+        } else {
+            self.eval_node(env, depth)
+        }
+    }
+
+    fn eval_node(&self, env: &HashMap<Symbol, Value>, depth: usize) -> Result<Value, ExprError> {
+        let next = depth + 1;
         match self {
             Expr::Var(s) => env.get(s).copied().ok_or(ExprError::UnboundVar(*s)),
             Expr::Lit(v) => Ok(*v),
-            Expr::Unary(UnOp::Neg, e) => Ok(Value::Int(as_int(&e.eval(env)?)?.wrapping_neg())),
-            Expr::Unary(UnOp::Not, e) => Ok(Value::Bool(!as_bool(&e.eval(env)?)?)),
+            Expr::Unary(UnOp::Neg, e) => {
+                Ok(Value::Int(as_int(&e.eval_at(env, next)?)?.wrapping_neg()))
+            }
+            Expr::Unary(UnOp::Not, e) => Ok(Value::Bool(!as_bool(&e.eval_at(env, next)?)?)),
             // `&&` and `||` short-circuit, exactly as Rust (and therefore the
-            // `ascent!` macro and the WASM tier) do: the right operand is not
+            // `ascent!` macro) does: the right operand is not
             // evaluated — and so cannot fault — when the left decides the result.
             Expr::Binary(BinOp::And, a, b) => {
-                if as_bool(&a.eval(env)?)? {
-                    Ok(Value::Bool(as_bool(&b.eval(env)?)?))
+                if as_bool(&a.eval_at(env, next)?)? {
+                    Ok(Value::Bool(as_bool(&b.eval_at(env, next)?)?))
                 } else {
                     Ok(Value::Bool(false))
                 }
             }
             Expr::Binary(BinOp::Or, a, b) => {
-                if as_bool(&a.eval(env)?)? {
+                if as_bool(&a.eval_at(env, next)?)? {
                     Ok(Value::Bool(true))
                 } else {
-                    Ok(Value::Bool(as_bool(&b.eval(env)?)?))
+                    Ok(Value::Bool(as_bool(&b.eval_at(env, next)?)?))
                 }
             }
             Expr::Binary(op, a, b) => {
-                let va = a.eval(env)?;
-                let vb = b.eval(env)?;
+                let va = a.eval_at(env, next)?;
+                let vb = b.eval_at(env, next)?;
                 eval_binary(*op, va, vb)
             }
         }
@@ -225,8 +284,13 @@ fn eval_binary(op: BinOp, a: Value, b: Value) -> Result<Value, ExprError> {
     }
 }
 
-fn expect_type(e: &Expr, env: &HashMap<Symbol, Type>, want: Type) -> Result<(), ExprError> {
-    let got = e.infer(env)?;
+fn expect_type(
+    e: &Expr,
+    env: &HashMap<Symbol, Type>,
+    want: Type,
+    depth: usize,
+) -> Result<(), ExprError> {
+    let got = stack::guard(|| e.infer_at(env, depth))?;
     require(got == want, "operand type")
 }
 

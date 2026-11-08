@@ -5,10 +5,11 @@ Datalog **at runtime** and building **propose-then-verify** loops on top of it.
 
 - **[`ascent-jit`](ascent-jit/)** — a runtime interpreter for Ascent programs
   supplied *as data*. Load a program from text or IR, assert facts, run to a fixed
-  point, query relations, and ask *why* a tuple was derived. Rule expressions are
-  lowered to WebAssembly and JIT-compiled under a fuel-metered, import-free
-  sandbox, so a rich expression language stays safe even when the rules come from
-  an untrusted source.
+  point, query relations, and ask *why* a tuple was derived. Evaluation is
+  semi-naïve and indexed, and rule expressions are a small, total language
+  evaluated by a pure interpreter, so rules from an untrusted source cannot loop
+  or reach the host. (The name predates the retirement of its WebAssembly
+  expression tier; see [docs/0010](docs/0010-retire-the-wasm-expression-tier.md).)
 - **[`fact-query`](fact-query/)** — a **governance-free** proposer/verifier
   substrate over an `ascent-jit` fact base. It parses, form-checks, and evaluates
   conjunctive queries read-only under a cardinality bound, returning results *with
@@ -69,7 +70,7 @@ To build and test the Node.js module locally:
 
 ```sh
 rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --version 0.2.125
+cargo install wasm-bindgen-cli --version 0.2.126
 just node-build    # or: cd fact-query-node && npm install && npm run build
 just node-test     # or: cd fact-query-node && npm test
 ```

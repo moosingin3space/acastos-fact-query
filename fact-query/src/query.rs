@@ -113,23 +113,23 @@ fn collect_atom_vars(atom: &Atom, bound: &mut HashSet<Symbol>) {
     }
 }
 
-/// The variables referenced by an expression.
+/// The variables referenced by an expression. Iterative, so a hand-built tree
+/// of any depth cannot overflow the stack here.
 fn expr_vars(expr: &Expr) -> HashSet<Symbol> {
     let mut out = HashSet::new();
-    collect_expr_vars(expr, &mut out);
-    out
-}
-
-fn collect_expr_vars(expr: &Expr, out: &mut HashSet<Symbol>) {
-    match expr {
-        Expr::Var(s) => {
-            out.insert(*s);
-        }
-        Expr::Lit(_) => {}
-        Expr::Unary(_, inner) => collect_expr_vars(inner, out),
-        Expr::Binary(_, lhs, rhs) => {
-            collect_expr_vars(lhs, out);
-            collect_expr_vars(rhs, out);
+    let mut stack = vec![expr];
+    while let Some(e) = stack.pop() {
+        match e {
+            Expr::Var(s) => {
+                out.insert(*s);
+            }
+            Expr::Lit(_) => {}
+            Expr::Unary(_, inner) => stack.push(inner),
+            Expr::Binary(_, lhs, rhs) => {
+                stack.push(lhs);
+                stack.push(rhs);
+            }
         }
     }
+    out
 }

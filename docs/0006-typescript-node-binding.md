@@ -1,6 +1,9 @@
 # 0006: A Node.js / TypeScript binding
 
 - **Status:** Proposed
+- **Revised by:** [0010](0010-retire-the-wasm-expression-tier.md) — the binding
+  no longer reuses `ascent-jit-web`'s `WebExecutor` (that crate is removed);
+  the interpreter runs in-substrate
 - **Crate:** `fact-query-node` (a `wasm32`-only consumer crate, like
   `ascent-jit-web`)
 - **Builds on:** [0002](0002-fact-query-substrate.md) (the queries-grain

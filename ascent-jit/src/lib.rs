@@ -1,10 +1,11 @@
-//! A Just-in-Time Compiler for the Ascent library.
+//! A runtime engine for the Ascent library.
 //!
 //! `ascent-jit` evaluates an Ascent program supplied **as data** at runtime,
-//! without invoking the Rust compiler. The relational core is an interpreter
-//! (a tree-walk of a relational IR with a stratified fixed-point loop); the
-//! `if`/`let`/head expressions are lowered to WebAssembly and JIT-compiled by
-//! `wasmtime` (see [`wasm`]).
+//! without invoking the Rust compiler. It is a pure interpreter: a semi-naïve,
+//! indexed, stratified fixed-point loop over a relational IR (see [`eval`]),
+//! with `if`/`let`/head expressions evaluated by a tree walk (see [`expr`]).
+//! The crate name predates the retirement of its WebAssembly expression tier
+//! (ADR 0010).
 //!
 //! ```
 //! use ascent_jit::{Engine, Value};
@@ -28,8 +29,8 @@ pub mod expr;
 pub mod fuzz;
 pub mod ir;
 pub mod parser;
+mod stack;
 pub mod value;
-pub mod wasm;
 
 use std::collections::HashMap;
 
@@ -38,12 +39,9 @@ use crate::expr::Expr;
 use crate::ir::{BodyClause, Program};
 use crate::parser::ParseError;
 
-pub use crate::eval::{Derivation, ExprEval, QueryOutput, QuerySolution};
+pub use crate::eval::{Derivation, QueryOutput, QuerySolution};
 pub use crate::expr::ExprError;
 pub use crate::value::{Interner, Symbol, Type, Value};
-#[cfg(feature = "wasmtime")]
-pub use crate::wasm::WasmtimeExecutor;
-pub use crate::wasm::{WasmEval, WasmExecutor};
 
 /// Any error produced by the engine.
 #[derive(Debug)]
@@ -52,9 +50,6 @@ pub enum Error {
     Parse(ParseError),
     /// Validation or evaluation failed.
     Eval(EvalError),
-    /// The WASM expression tier failed to initialise.
-    #[cfg(feature = "wasmtime")]
-    Wasm(ExprError),
 }
 
 impl std::fmt::Display for Error {
@@ -62,8 +57,6 @@ impl std::fmt::Display for Error {
         match self {
             Error::Parse(e) => write!(f, "{e}"),
             Error::Eval(e) => write!(f, "{e}"),
-            #[cfg(feature = "wasmtime")]
-            Error::Wasm(e) => write!(f, "{e}"),
         }
     }
 }
@@ -79,17 +72,6 @@ impl From<ParseError> for Error {
 impl From<EvalError> for Error {
     fn from(e: EvalError) -> Self {
         Error::Eval(e)
-    }
-}
-
-/// The pure tree-walking expression evaluator. It is the differential oracle
-/// for the WASM tier and is available as an alternative backend.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Interpreter;
-
-impl ExprEval for Interpreter {
-    fn eval_expr(&mut self, expr: &Expr, env: &HashMap<Symbol, Value>) -> Result<Value, ExprError> {
-        expr.eval(env)
     }
 }
 
@@ -133,60 +115,25 @@ pub struct Engine {
     program: Program,
     interner: Interner,
     db: Database,
-    evaluator: Box<dyn ExprEval>,
 }
 
 impl Engine {
-    /// Parses `src` and builds an engine backed by the default `wasmtime` WASM
-    /// expression tier.
+    /// Parses `src` and builds an engine over it, with an empty database.
     ///
     /// # Errors
     ///
-    /// Returns [`Error`] if the source fails to parse, the program fails
-    /// validation/stratification, or the WASM engine cannot be initialised.
-    #[cfg(feature = "wasmtime")]
+    /// Returns [`Error`] if the source fails to parse, or the program fails
+    /// validation/stratification.
     pub fn from_source(src: &str) -> Result<Self, Error> {
-        let evaluator = WasmEval::new().map_err(Error::Wasm)?;
-        Self::from_source_with_evaluator(src, Box::new(evaluator))
-    }
-
-    /// Parses `src` and builds an engine backed by the pure interpreter.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error`] if the source fails to parse or validate.
-    pub fn from_source_interpreted(src: &str) -> Result<Self, Error> {
-        Self::from_source_with_evaluator(src, Box::new(Interpreter))
-    }
-
-    /// Parses `src` and builds an engine over a caller-supplied expression
-    /// evaluator. This is the executor-swapping entry point: a host without
-    /// `wasmtime` (e.g. browser-wasm) passes a [`WasmEval`] built over its own
-    /// [`WasmExecutor`], reusing the entire encoding pipeline.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error`] if the source fails to parse or validate.
-    pub fn from_source_with_evaluator(
-        src: &str,
-        mut evaluator: Box<dyn ExprEval>,
-    ) -> Result<Self, Error> {
         let mut interner = Interner::new();
         let program = parser::parse(src, &mut interner)?;
         // Validate eagerly so a malformed program is rejected at load time.
         eval::stratify(&program)?;
-        // Compile the whole program's expression tier up front (ADR 0005): a
-        // compiling backend builds its single module here so `run` instantiates
-        // nothing. The interpreter's `prime` is a no-op.
-        evaluator
-            .prime(&program.exprs())
-            .map_err(|e| Error::Eval(e.into()))?;
         let db = Database::new(&program);
         Ok(Engine {
             program,
             interner,
             db,
-            evaluator,
         })
     }
 
@@ -217,7 +164,7 @@ impl Engine {
     ///
     /// Returns [`Error`] on stratification or evaluation failure.
     pub fn run(&mut self) -> Result<(), Error> {
-        eval::run(&self.program, &mut self.db, self.evaluator.as_mut())?;
+        eval::run(&self.program, &mut self.db)?;
         Ok(())
     }
 
@@ -242,7 +189,7 @@ impl Engine {
         for (relation, tuple) in facts {
             fork.insert_fact(relation, tuple.clone())?;
         }
-        eval::run(&self.program, &mut fork, self.evaluator.as_mut())?;
+        eval::run(&self.program, &mut fork)?;
 
         let mut added = HashMap::new();
         for decl in &self.program.relations {
@@ -270,14 +217,8 @@ impl Engine {
     /// # Errors
     ///
     /// Returns [`Error`] if `relation` is unknown or a clause fails to evaluate.
-    pub fn explain(&mut self, relation: &str, tuple: &[Value]) -> Result<Vec<Derivation>, Error> {
-        Ok(eval::explain(
-            &self.program,
-            &self.db,
-            self.evaluator.as_mut(),
-            relation,
-            tuple,
-        )?)
+    pub fn explain(&self, relation: &str, tuple: &[Value]) -> Result<Vec<Derivation>, Error> {
+        Ok(eval::explain(&self.program, &self.db, relation, tuple)?)
     }
 
     /// Parses a conjunctive query in surface syntax — `(e1, e2, ..) <-- clause,
@@ -324,18 +265,12 @@ impl Engine {
     /// Returns [`Error`] on an unknown relation or an expression-evaluation
     /// failure.
     pub fn evaluate_query(
-        &mut self,
+        &self,
         outputs: &[Expr],
         body: &[BodyClause],
         max: usize,
     ) -> Result<QueryOutput, Error> {
-        Ok(eval::eval_query(
-            &self.db,
-            self.evaluator.as_mut(),
-            outputs,
-            body,
-            max,
-        )?)
+        Ok(eval::eval_query(&self.db, outputs, body, max)?)
     }
 
     /// The loaded program IR.

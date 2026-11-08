@@ -1,6 +1,10 @@
 # 0008: Measure first — the join-JIT deferral and the expression-backend choice
 
 - **Status:** Accepted
+- **Revised by:** [0009](0009-semi-naive-indexed-evaluation.md) (the
+  algorithmic work this record ordered) and
+  [0010](0010-retire-the-wasm-expression-tier.md) (decision 4's evaluator choice
+  is removed along with the wasm tier)
 - **Crates:** `ascent-jit` (benchmarks), `fact-query-node` (evaluator selection)
 - **Builds on:** [0001](0001-ascent-jit-runtime-engine.md) (the deferred
   whole-rule-body JIT), [0004](0004-pluggable-wasm-execution.md) /
