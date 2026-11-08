@@ -1,6 +1,6 @@
 {
   "name": "@acastos/fact-query",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Node.js, Cloudflare Workers, and TypeScript bindings for fact-query: parse, form-check, and bounded read-only conjunctive-query evaluation with provenance, in WebAssembly.",
   "license": "MIT OR Apache-2.0",
   "author": "Nathan Moos <moosingin3space@gmail.com>",

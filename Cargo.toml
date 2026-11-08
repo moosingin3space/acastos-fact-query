@@ -15,7 +15,7 @@ exclude = [
 
 [workspace.package]
 authors = ["Nathan Moos <moosingin3space@gmail.com>"]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/moosingin3space/acastos-fact-query"
@@ -34,4 +34,4 @@ allow_attributes = "deny"
 
 [workspace.dependencies]
 # Workspace-level deps stay feature-minimal; consumers opt in (ADR 0008).
-ascent-jit = { path = "ascent-jit", version = "^0.1.0", default-features = false } #unified
+ascent-jit = { path = "ascent-jit", version = "^0.2.0", default-features = false } #unified
