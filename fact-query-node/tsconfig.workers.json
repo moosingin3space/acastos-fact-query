@@ -1,0 +1,13 @@
+{
+  // The Cloudflare Workers build: the same core as ESM, plus the workerd entry.
+  // Emitted beside the package root (not under dist/) so the entry's relative
+  // import of ../wasm-workers/ resolves the same in source and output.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "es2022",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "WebWorker"],
+    "outDir": "dist-workers"
+  },
+  "files": ["ts/workers.ts", "ts/core.ts", "ts/wasm-module.d.ts"]
+}

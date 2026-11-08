@@ -62,3 +62,8 @@ node-build:
 # Build the Node.js binding and run its test suite.
 node-test:
     cd fact-query-node && npm install && npm test
+
+# Build the binding and run its Cloudflare Workers build inside workerd
+# (Miniflare).
+node-test-workers:
+    cd fact-query-node && npm install && npm run test:workers

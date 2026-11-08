@@ -18,11 +18,14 @@ before any design change.
   `ascent-jit` fact base. The `FactStore` trait is the query seam; `FactSource`
   is the produce seam. v1 ships the conjunctive **queries grain** only.
 - **`fact-query-node`** — a `wasm32`-only, workspace-*excluded* crate: the
-  Node.js/TypeScript binding. wasm-bindgen-exports a `FactEngine` over
-  `fact-query` (the interpreter runs in-substrate), published as an npm
-  package with a hand-written TS wrapper. Built via its own npm pipeline
-  (`just node-build` / `cd fact-query-node && npm run build`), not `cargo`. See
-  [docs/0006](docs/0006-typescript-node-binding.md).
+  Node.js / Cloudflare Workers / TypeScript binding. wasm-bindgen-exports a
+  `FactEngine` over `fact-query` (the interpreter runs in-substrate), published
+  as one npm package with a hand-written TS wrapper; a `workerd` export
+  condition selects its ESM Workers build. Built via its own npm pipeline
+  (`just node-build` / `cd fact-query-node && npm run build`), not `cargo`.
+  `npm test` covers the Node build; `npm run test:workers` runs the Workers
+  build inside workerd. See [docs/0006](docs/0006-typescript-node-binding.md)
+  and [docs/0011](docs/0011-cloudflare-workers-build.md).
 
 `fact-query` depends on `ascent-jit`; `fact-query-node` depends on `fact-query`
 and `ascent-jit`. No crate depends on any

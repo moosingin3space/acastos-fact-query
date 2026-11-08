@@ -57,8 +57,9 @@ the contract and an example.
 
 ## Node.js / TypeScript Binding
 
-A WebAssembly binding is available for Node.js and TypeScript projects via
-`@acastos/fact-query`. See [`fact-query-node/README.md`](fact-query-node/README.md)
+A WebAssembly binding is available for Node.js, Cloudflare Workers, and
+TypeScript projects via `@acastos/fact-query` (wrangler selects the Workers
+build automatically). See [`fact-query-node/README.md`](fact-query-node/README.md)
 for the full API documentation.
 
 This binding is not automatically built, so in order to make it usable
@@ -73,6 +74,7 @@ rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.126
 just node-build    # or: cd fact-query-node && npm install && npm run build
 just node-test     # or: cd fact-query-node && npm test
+just node-test-workers   # the Workers build, inside workerd
 ```
 
 The build produces a WebAssembly module and TypeScript bindings. After building,

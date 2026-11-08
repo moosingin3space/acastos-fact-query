@@ -1,7 +1,7 @@
 {
   "name": "@acastos/fact-query",
   "version": "0.1.0",
-  "description": "Node.js/TypeScript bindings for fact-query: parse, form-check, and bounded read-only conjunctive-query evaluation with provenance, in WebAssembly.",
+  "description": "Node.js, Cloudflare Workers, and TypeScript bindings for fact-query: parse, form-check, and bounded read-only conjunctive-query evaluation with provenance, in WebAssembly.",
   "license": "MIT OR Apache-2.0",
   "author": "Nathan Moos <moosingin3space@gmail.com>",
   "repository": {
@@ -14,24 +14,40 @@
     "neurosymbolic",
     "provenance",
     "verifier",
-    "wasm"
+    "wasm",
+    "cloudflare-workers"
   ],
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "workerd": {
+        "types": "./dist-workers/workers.d.ts",
+        "default": "./dist-workers/workers.js"
+      },
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
   "files": [
     "dist/",
     "wasm/",
+    "dist-workers/",
+    "wasm-workers/",
     "README.md"
   ],
   "scripts": {
-    "build:wasm": "cargo build --target wasm32-unknown-unknown --release && wasm-bindgen --target nodejs --out-dir wasm target/wasm32-unknown-unknown/release/fact_query_node.wasm",
-    "build:ts": "tsc",
+    "build:wasm": "cargo build --target wasm32-unknown-unknown --release && wasm-bindgen --target nodejs --out-dir wasm target/wasm32-unknown-unknown/release/fact_query_node.wasm && wasm-bindgen --target web --out-dir wasm-workers target/wasm32-unknown-unknown/release/fact_query_node.wasm && node scripts/mark-esm.cjs wasm-workers",
+    "build:ts": "tsc && tsc -p tsconfig.workers.json && node scripts/mark-esm.cjs dist-workers",
     "build": "npm run build:wasm && npm run build:ts",
     "test": "npm run build && node --test",
+    "test:workers": "npm run build && node --test workers-test/workerd.cjs",
     "bench": "npm run build && node bench/bench.cjs",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
+    "miniflare": "^4.20260730.0",
     "typescript": "^7.0.0"
   },
   "engines": {
