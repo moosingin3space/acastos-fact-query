@@ -31,7 +31,7 @@ pub mod parser;
 pub mod value;
 pub mod wasm;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::eval::{Database, EvalError};
 use crate::expr::Expr;
@@ -246,12 +246,7 @@ impl Engine {
 
         let mut added = HashMap::new();
         for decl in &self.program.relations {
-            let before: HashSet<Vec<Value>> = self.db.tuples(&decl.name).into_iter().collect();
-            let mut delta: Vec<Vec<Value>> = fork
-                .tuples(&decl.name)
-                .into_iter()
-                .filter(|t| !before.contains(t))
-                .collect();
+            let mut delta = fork.added_since(&self.db, &decl.name);
             if !delta.is_empty() {
                 delta.sort();
                 added.insert(decl.name.clone(), delta);

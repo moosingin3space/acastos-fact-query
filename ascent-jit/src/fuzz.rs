@@ -422,6 +422,69 @@ pub fn differential_program(u: &mut Unstructured) -> Result<()> {
     Ok(())
 }
 
+/// Runs `facts` through `program` in two batches — load the first, run, load
+/// the rest, run again — using either the semi-naïve engine (whose second run
+/// is incremental) or the naïve reference loop (which recomputes everything).
+fn run_batched(
+    program: &Program,
+    facts: &Facts,
+    split: usize,
+    naive: bool,
+) -> std::result::Result<Database, EvalError> {
+    let mut db = Database::new(program);
+    for batch in [&facts[..split], &facts[split..]] {
+        for (relation, tuple) in batch {
+            let _ = db.insert(relation, tuple.clone());
+        }
+        if naive {
+            eval::run_naive(program, &mut db, &mut Interpreter)?;
+        } else {
+            eval::run(program, &mut db, &mut Interpreter)?;
+        }
+    }
+    Ok(db)
+}
+
+/// Generates a random stratifiable program and facts, then asserts the
+/// semi-naïve, indexed evaluator agrees with the naïve, index-free reference
+/// loop — including across an incremental second run over facts added after
+/// the first fixed point. Panics on divergence.
+///
+/// # Errors
+///
+/// Returns an [`arbitrary::Error`] only if the byte source is exhausted.
+///
+/// # Panics
+///
+/// Panics if the two evaluators derive different relations, or if one fails
+/// while the other succeeds.
+pub fn differential_seminaive(u: &mut Unstructured) -> Result<()> {
+    let (program, facts) = arb_program(u)?;
+    let split = u.int_in_range(0..=facts.len())?;
+    let fast = run_batched(&program, &facts, split, false);
+    let naive = run_batched(&program, &facts, split, true);
+    match (fast, naive) {
+        (Ok(d1), Ok(d2)) => {
+            for r in &program.relations {
+                let a: BTreeSet<Vec<Value>> = d1.tuples(&r.name).into_iter().collect();
+                let b: BTreeSet<Vec<Value>> = d2.tuples(&r.name).into_iter().collect();
+                assert_eq!(
+                    a, b,
+                    "relation `{}` diverged (split {split}) for {program:?} with {facts:?}",
+                    r.name
+                );
+            }
+        }
+        (Err(_), Err(_)) => {}
+        (a, b) => panic!(
+            "evaluator divergence: semi-naive={:?} naive={:?} for {program:?}",
+            a.err(),
+            b.err()
+        ),
+    }
+    Ok(())
+}
+
 // ----- fact generators for the macro fact-fuzzing layer --------------------
 
 /// Generates up to `max_len` integer pairs in `[lo, hi]`, for fuzzing the EDB
