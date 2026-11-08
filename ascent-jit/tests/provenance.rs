@@ -71,12 +71,7 @@ fn explains_a_recursive_derivation() {
 #[test]
 fn unprovable_tuple_has_no_derivations() {
     let engine = closure_engine();
-    assert!(
-        engine
-            .explain("path", &[int(9), int(9)])
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(engine.explain("path", &[int(9), int(9)]).unwrap(), []);
 }
 
 /// Explaining an unknown relation is an error.
