@@ -25,8 +25,10 @@
 //!    write semantics, so it cannot mutate persisted state at the grammar level,
 //!    without any handle plumbing to defend that;
 //! 5. **Cardinality-bounded** — evaluation cannot blow up space past the
-//!    supplied [`Cardinality`] cap; hitting the cap is a first-class outcome
-//!    ([`ResultSet::is_truncated`]), not an error.
+//!    supplied [`Limits`]: at most so many rows, each with at most so many
+//!    justifications. Hitting either cap is a first-class outcome
+//!    ([`ResultSet::is_truncated`] for rows, [`Provenance::is_truncated`] for
+//!    evidence), not an error.
 //!
 //! **It explicitly does _not_ guarantee the sixth thing a caller might wish for:
 //! that the query _answers the question asked_.** The substrate checks *form*,
@@ -65,35 +67,69 @@ pub struct TutorialDoctests;
 
 pub use crate::error::FactQueryError;
 pub use crate::query::ConjunctiveQuery;
-pub use crate::result::{Justification, Provenance, ResultSet, RowProvenance, SupportTuple};
+pub use crate::result::{FactView, Justification, Provenance, ResultSet, SupportFact};
 pub use crate::schema::{RelationSchema, Schema};
 pub use crate::source::{
     ContentId, FactSource, LoweredTuple, PredicateDescriptor, PredicateId, SchemaDrift,
     SchemaFingerprint, TupleStream,
 };
 
-/// A cap on the number of solutions [`eval`](FactStore::eval) collects before it
-/// stops and reports the result as truncated.
+/// The bounds on one [`eval`](FactStore::eval): a cap on result **rows** and,
+/// independently, a cap on **justifications kept per row**.
 ///
 /// The bound is on **cardinality, not time**: a conjunctive query always
-/// terminates, so the only blast radius is *space*. The cap ensures an
-/// unfiltered (cartesian-product) join is truncated rather than allowed to
-/// exhaust memory. A forgotten cap is a memory-exhaustion `DoS`, so the bound is
-/// threaded through every evaluation.
+/// terminates, so the blast radius that must be capped is *space*. The output
+/// holds at most `max_rows` rows with at most `max_justifications_per_row`
+/// justifications each, so an unfiltered (cartesian-product) join is truncated
+/// rather than allowed to exhaust memory. A forgotten cap is a
+/// memory-exhaustion `DoS`, so the bound is threaded through every evaluation.
+///
+/// The caps are separate so the two kinds of incompleteness stay apart: "these
+/// are not all the answers" ([`ResultSet::is_truncated`]) versus "these are
+/// all the answers, but not every reason" ([`Provenance::is_truncated`]). If
+/// the row cap stops evaluation, both are reported, since the remaining
+/// evidence was not examined either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Cardinality(usize);
+pub struct Limits {
+    max_rows: usize,
+    max_justifications_per_row: usize,
+}
 
-impl Cardinality {
-    /// A cap of at most `max` result solutions.
+impl Limits {
+    /// The per-row justification cap used by [`Limits::rows`]: enough evidence
+    /// to show for a row, small enough that a highly-redundant join stays
+    /// cheap.
+    pub const DEFAULT_JUSTIFICATIONS_PER_ROW: usize = 16;
+
+    /// At most `max_rows` rows, with the default per-row justification cap
+    /// ([`Limits::DEFAULT_JUSTIFICATIONS_PER_ROW`]).
     #[must_use]
-    pub fn new(max: usize) -> Self {
-        Self(max)
+    pub fn rows(max_rows: usize) -> Self {
+        Self {
+            max_rows,
+            max_justifications_per_row: Self::DEFAULT_JUSTIFICATIONS_PER_ROW,
+        }
     }
 
-    /// The cap as a count.
+    /// Replaces the per-row justification cap.
     #[must_use]
-    pub fn get(self) -> usize {
-        self.0
+    pub fn with_justifications_per_row(self, max: usize) -> Self {
+        Self {
+            max_justifications_per_row: max,
+            ..self
+        }
+    }
+
+    /// The row cap.
+    #[must_use]
+    pub fn max_rows(self) -> usize {
+        self.max_rows
+    }
+
+    /// The per-row justification cap.
+    #[must_use]
+    pub fn max_justifications_per_row(self) -> usize {
+        self.max_justifications_per_row
     }
 }
 
@@ -139,9 +175,10 @@ pub trait FactStore {
     fn check(&self, query: &Self::Query) -> Result<(), Self::Error>;
 
     /// Read-only, cardinality-bounded evaluation against the current fixed
-    /// point (guarantees 4 and 5). Returns the result rows **and** their
-    /// provenance — provenance is always part of the result, never optional,
-    /// because it is the one bridge to "why believe this row".
+    /// point (guarantees 4 and 5), under the row and evidence caps in
+    /// `limits`. Returns the result rows **and** their provenance — provenance
+    /// is always part of the result, never optional, because it is the one
+    /// bridge to "why believe this row".
     ///
     /// # Errors
     ///
@@ -151,6 +188,6 @@ pub trait FactStore {
     fn eval(
         &mut self,
         query: &Self::Query,
-        max: Cardinality,
+        limits: Limits,
     ) -> Result<(Self::ResultSet, Self::Provenance), Self::Error>;
 }

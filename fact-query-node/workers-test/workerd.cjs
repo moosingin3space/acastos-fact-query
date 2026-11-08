@@ -33,6 +33,8 @@ test("the Workers build loads and evaluates inside workerd", async () => {
       ],
       truncated: false,
       support: [1, 1, 1],
+      atoms: ["path"],
+      evidenceTruncated: false,
       schema: ["edge", "path"],
       errorStage: "schema",
     });

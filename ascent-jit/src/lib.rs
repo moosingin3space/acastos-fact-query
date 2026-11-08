@@ -41,7 +41,7 @@ use crate::expr::Expr;
 use crate::ir::{BodyClause, Program};
 use crate::parser::ParseError;
 
-pub use crate::eval::{Derivation, QueryOutput, QuerySolution};
+pub use crate::eval::{Derivation, FactRef, QueryLimits, QueryOutput, Support};
 pub use crate::expr::ExprError;
 pub use crate::value::{Interner, Symbol, Type, Value};
 
@@ -223,6 +223,30 @@ impl Engine {
         Ok(eval::explain(&self.program, &self.db, relation, tuple)?)
     }
 
+    /// Resolves a fact handle — from a [`Derivation`] or a [`QueryOutput`] — to
+    /// its relation name and tuple. `None` if the handle did not come from this
+    /// engine's database.
+    #[must_use]
+    pub fn fact(&self, fact: FactRef) -> Option<(&str, &[Value])> {
+        self.db.fact(fact)
+    }
+
+    /// Explains a fact by handle: [`Engine::explain`] on the fact `fact` names.
+    /// Since a [`Derivation`]'s support is itself handles, this walks a
+    /// derivation tree one step at a time. A base fact has no derivations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if the handle did not come from this engine's database
+    /// (as [`EvalError::UnknownRelation`]), or a clause fails to evaluate.
+    pub fn explain_fact(&self, fact: FactRef) -> Result<Vec<Derivation>, Error> {
+        let (relation, tuple) = self
+            .db
+            .fact(fact)
+            .ok_or_else(|| Error::Eval(EvalError::UnknownRelation(format!("{fact:?}"))))?;
+        self.explain(relation, tuple)
+    }
+
     /// Parses a conjunctive query in surface syntax — `(e1, e2, ..) <-- clause,
     /// ..` — into its output expressions and body clauses, interning symbols into
     /// the engine's interner. This is the queries-grain front end; it performs
@@ -253,9 +277,10 @@ impl Engine {
     }
 
     /// Evaluates a parsed conjunctive query read-only against the current
-    /// materialized state, returning every solution with provenance, capped at
-    /// `max` solutions ([`QueryOutput::truncated`] is set if the cap is hit).
-    /// Call [`Engine::run`] first so the query observes the fixed point.
+    /// materialized state, returning its distinct rows with provenance under
+    /// the two independent caps in `limits` (see [`QueryOutput`] for the
+    /// truncation flags). Call [`Engine::run`] first so the query observes the
+    /// fixed point.
     ///
     /// This neither forks nor mutates the database — it is the queries-grain
     /// primitive and cannot affect persisted state. Callers should
@@ -270,9 +295,9 @@ impl Engine {
         &self,
         outputs: &[Expr],
         body: &[BodyClause],
-        max: usize,
+        limits: QueryLimits,
     ) -> Result<QueryOutput, Error> {
-        Ok(eval::eval_query(&self.db, outputs, body, max)?)
+        Ok(eval::eval_query(&self.db, outputs, body, limits)?)
     }
 
     /// The loaded program IR.

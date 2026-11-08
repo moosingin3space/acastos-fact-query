@@ -55,8 +55,10 @@ application.
   never an `Answer`. Do not let the API imply intent-fidelity it does not
   guarantee. See [docs/0002](docs/0002-fact-query-substrate.md).
 - **Bound every evaluation.** Conjunctive query evaluation is capped on
-  *cardinality* (not time); a forgotten cap is a memory-exhaustion DoS. Hitting
-  the cap is a first-class, surfaced outcome, not an error.
+  *cardinality* (not time): independently on rows and on justifications kept
+  per row ([docs/0013](docs/0013-normalized-provenance-and-independent-caps.md)).
+  A forgotten cap is a memory-exhaustion DoS. Hitting either cap is a
+  first-class, surfaced outcome ("may be incomplete"), not an error.
 
 ## Development
 

@@ -218,3 +218,63 @@ impl KeyTable {
         }
     }
 }
+
+/// A small open-addressing map from `u64` keys to dense `u32` ids, assigned in
+/// insertion order. Used to deduplicate fact handles in query provenance.
+#[derive(Debug, Clone)]
+pub(crate) struct IdMap {
+    /// Power-of-two sized; each entry is an index into `keys`, or [`EMPTY`].
+    slots: Vec<u32>,
+    keys: Vec<u64>,
+}
+
+impl Default for IdMap {
+    fn default() -> Self {
+        IdMap {
+            slots: vec![EMPTY; 16],
+            keys: Vec::new(),
+        }
+    }
+}
+
+impl IdMap {
+    /// The id of `key`, assigning the next id if it is new. Returns the id and
+    /// whether it was newly assigned.
+    pub(crate) fn get_or_insert(&mut self, key: u64) -> (u32, bool) {
+        let hash = fold(key ^ seed(), MUL);
+        let mask = self.slots.len() - 1;
+        let mut i = slot_of(hash, mask);
+        loop {
+            let id = self.slots[i];
+            if id == EMPTY {
+                break;
+            }
+            if self.keys[id as usize] == key {
+                return (id, false);
+            }
+            i = (i + 1) & mask;
+        }
+        let id = u32::try_from(self.keys.len()).unwrap_or(EMPTY - 1);
+        self.keys.push(key);
+        if self.keys.len() * 2 > self.slots.len() {
+            self.slots = vec![EMPTY; self.slots.len() * 2];
+            for n in 0..self.keys.len() {
+                let k = self.keys[n];
+                let n = u32::try_from(n).unwrap_or(EMPTY - 1);
+                self.place(fold(k ^ seed(), MUL), n);
+            }
+        } else {
+            self.slots[i] = id;
+        }
+        (id, true)
+    }
+
+    fn place(&mut self, hash: u64, id: u32) {
+        let mask = self.slots.len() - 1;
+        let mut i = slot_of(hash, mask);
+        while self.slots[i] != EMPTY {
+            i = (i + 1) & mask;
+        }
+        self.slots[i] = id;
+    }
+}

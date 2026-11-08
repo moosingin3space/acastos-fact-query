@@ -22,7 +22,7 @@ negation.
 
 ```rust
 use ascent_jit::{Engine, Value};
-use fact_query::{Cardinality, FactStore};
+use fact_query::{FactStore, Limits};
 
 let mut engine = Engine::from_source("relation edge(int, int);").unwrap();
 engine.add_fact("edge", vec![Value::Int(1), Value::Int(2)]).unwrap();
@@ -32,14 +32,15 @@ engine.run().unwrap();
 // Parse -> form-check -> bounded, read-only evaluation.
 let query = engine.parse_query("(x, z) <-- edge(x, y), edge(y, z)").unwrap();
 engine.check(&query).unwrap();
-let (results, provenance) = engine.eval(&query, Cardinality::new(10_000)).unwrap();
+let (results, provenance) = engine.eval(&query, Limits::rows(10_000)).unwrap();
 
 assert_eq!(results.rows().to_vec(), vec![vec![Value::Int(1), Value::Int(3)]]);
 assert!(!results.is_truncated());
 
 // Provenance says *why*: the two edges that joined to yield the row.
-assert_eq!(provenance.rows().len(), 1);
-assert_eq!(provenance.rows()[0].justifications[0].support.len(), 2);
+assert_eq!(provenance.len(), 1);
+let first = provenance.justifications(0).next().unwrap();
+assert_eq!(first.support().len(), 2);
 ```
 
 ## The contract — five guarantees, one disclaimer
@@ -56,10 +57,13 @@ LLM in the verification loop**, that it is:
    write semantics, so it cannot mutate persisted state *at the grammar level*,
    not by handle plumbing.
 5. **Cardinality-bounded** — evaluation cannot blow up space past the supplied
-   `Cardinality` cap. The bound is on **cardinality, not time** (a conjunctive
-   query always terminates; the only blast radius is space). **Hitting the cap is
-   a first-class outcome** (`ResultSet::is_truncated`), surfaced — never an error
-   to paper over. A forgotten cap is a memory-exhaustion DoS.
+   `Limits`: a cap on rows and, independently, a cap on justifications kept per
+   row. The bound is on **cardinality, not time** (a conjunctive query always
+   terminates; the only blast radius is space). **Hitting a cap is a
+   first-class outcome**, surfaced — never an error to paper over:
+   `ResultSet::is_truncated` means "there may be more rows",
+   `Provenance::is_truncated` means "some row may have more reasons". A
+   forgotten cap is a memory-exhaustion DoS.
 
 ### What it does **not** guarantee
 

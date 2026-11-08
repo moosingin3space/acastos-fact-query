@@ -8,7 +8,7 @@
 use std::hint::black_box;
 
 use ascent_jit::ir::BodyClause;
-use ascent_jit::{Engine, Value};
+use ascent_jit::{Engine, QueryLimits, Value};
 use criterion::{Criterion, criterion_group, criterion_main};
 
 /// Schema for the fact base. No rules: the queries grain evaluates directly
@@ -23,9 +23,13 @@ const QUERY: &str = "(u, b) <-- usr(u, d), dept(d, b), active(u), if b > 500";
 
 const USERS: i64 = 300;
 const DEPTS: i64 = 30;
-/// No-truncation cap: comfortably above the solution count, so the full join is
-/// measured rather than an early cut-off.
-const MAX: usize = 100_000;
+/// No-truncation caps: comfortably above the row and per-row justification
+/// counts, so the full join and all of its provenance are measured rather than
+/// an early cut-off.
+const LIMITS: QueryLimits = QueryLimits {
+    max_rows: 100_000,
+    max_justifications_per_row: 100_000,
+};
 
 fn load_engine() -> Engine {
     let mut engine = Engine::from_source(SRC).expect("program loads");
@@ -60,9 +64,9 @@ fn bench_queries(c: &mut Criterion) {
     group.bench_function("interpreted", |b| {
         b.iter(|| {
             let out = engine
-                .evaluate_query(&outputs, &body, MAX)
+                .evaluate_query(&outputs, &body, LIMITS)
                 .expect("query evaluates");
-            black_box(out.solutions.len())
+            black_box(out.len())
         });
     });
     group.finish();

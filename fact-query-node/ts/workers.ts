@@ -36,6 +36,8 @@ setBinding(WasmFactEngine);
 
 export {
   DEFAULT_MAX_CARDINALITY,
+  DEFAULT_MAX_JUSTIFICATIONS_PER_ROW,
+  DEFAULT_MAX_ROWS,
   FactEngine,
   FactQueryError,
 } from "./core.js";
@@ -43,11 +45,11 @@ export type {
   ColumnType,
   FactValue,
   FactValueInput,
-  Justification,
+  Provenance,
+  QueryLimits,
   QueryResult,
   RelationSchema,
-  RowProvenance,
   Schema,
   Stage,
-  SupportTuple,
+  SupportFact,
 } from "./core.js";

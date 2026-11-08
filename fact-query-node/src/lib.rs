@@ -31,7 +31,7 @@
 #![cfg(target_arch = "wasm32")]
 
 use ascent_jit::{Engine, Type, Value};
-use fact_query::{Cardinality, FactQueryError, FactStore};
+use fact_query::{FactQueryError, FactStore, Limits};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
@@ -79,29 +79,29 @@ struct SchemaOut {
     relations: Vec<RelationSchemaOut>,
 }
 
-/// One supporting fact in a justification.
+/// One distinct supporting fact.
 #[derive(Debug, Serialize)]
-struct SupportTupleOut {
-    /// The relation the supporting fact belongs to.
-    relation: String,
-    /// The supporting fact itself.
+struct FactOut {
+    /// Index into the provenance's `relations`.
+    relation: u32,
+    /// The fact itself.
     tuple: Vec<WireValue>,
 }
 
-/// One way a row was produced: the body facts that joined to yield it.
+/// A result set's provenance, normalized: every distinct supporting fact once,
+/// justifications as indices. The flat `offsets` / `support` arrays are not
+/// serialized here; [`FactEngine::query`] attaches them as `Uint32Array`s.
 #[derive(Debug, Serialize)]
-struct JustificationOut {
-    /// The body facts that joined, in body order.
-    support: Vec<SupportTupleOut>,
-}
-
-/// The provenance of one result row: the row plus every justification found.
-#[derive(Debug, Serialize)]
-struct RowProvenanceOut {
-    /// The result row this provenance explains.
-    row: Vec<WireValue>,
-    /// Every justification for the row (at least one).
-    justifications: Vec<JustificationOut>,
+struct ProvenanceOut {
+    /// The distinct relation names referenced.
+    relations: Vec<String>,
+    /// Per support column (positive body atom, in body order): an index into
+    /// `relations`.
+    atoms: Vec<u32>,
+    /// The distinct supporting facts.
+    facts: Vec<FactOut>,
+    /// Whether some row may have justifications that were not returned.
+    truncated: bool,
 }
 
 /// The full result of a query: rows, truncation flag, and aligned provenance.
@@ -109,11 +109,11 @@ struct RowProvenanceOut {
 struct QueryResultOut {
     /// The distinct result rows.
     rows: Vec<Vec<WireValue>>,
-    /// Whether evaluation stopped at the cardinality cap (a prefix of the full
-    /// result, a first-class outcome — not an error).
+    /// Whether more rows may exist than were returned (the row cap was hit; a
+    /// first-class outcome, not an error).
     truncated: bool,
-    /// One entry per row, aligned by index with `rows`.
-    provenance: Vec<RowProvenanceOut>,
+    /// The rows' provenance, aligned by index with `rows`.
+    provenance: ProvenanceOut,
 }
 
 /// A fact base that evaluates the `fact-query` queries grain inside wasm.
@@ -228,8 +228,13 @@ impl FactEngine {
     }
 
     /// Parses, form-checks, and evaluates `text` read-only against the current
-    /// fixed point, capped at `max_cardinality` solutions. Returns the distinct
-    /// rows, whether the result was truncated at the cap, and per-row provenance.
+    /// fixed point, keeping at most `max_rows` rows and at most
+    /// `max_justifications_per_row` justifications per row. Returns the
+    /// distinct rows, whether more rows may exist, and normalized provenance
+    /// (`relations`, `atoms`, `facts`, `truncated`, plus `offsets` and
+    /// `support` as `Uint32Array`s: row `r`'s justifications are
+    /// `offsets[r]..offsets[r + 1]`, and justification `j`'s facts are
+    /// `support[j * k..(j + 1) * k]` with `k = atoms.length`).
     ///
     /// # Errors
     ///
@@ -237,12 +242,19 @@ impl FactEngine {
     /// per the guarantee that failed. An `"eval"` fault is indeterminate — a
     /// safety-conscious caller must treat the thrown error fail-closed, never as
     /// an empty result.
-    pub fn query(&mut self, text: &str, max_cardinality: u32) -> Result<JsValue, JsValue> {
+    pub fn query(
+        &mut self,
+        text: &str,
+        max_rows: u32,
+        max_justifications_per_row: u32,
+    ) -> Result<JsValue, JsValue> {
         let query = self.engine.parse_query(text).map_err(query_error)?;
         FactStore::check(&self.engine, &query).map_err(query_error)?;
+        let limits = Limits::rows(max_rows as usize)
+            .with_justifications_per_row(max_justifications_per_row as usize);
         let (results, provenance) = self
             .engine
-            .eval(&query, Cardinality::new(max_cardinality as usize))
+            .eval(&query, limits)
             .map_err(query_error)?;
 
         let rows = results
@@ -250,18 +262,57 @@ impl FactEngine {
             .iter()
             .map(|row| self.lift_row(row))
             .collect::<Result<Vec<_>, _>>()?;
-        let provenance = provenance
-            .rows()
+        let facts = provenance
+            .facts()
             .iter()
-            .map(|rp| self.lift_provenance(rp))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|f| {
+                Ok(FactOut {
+                    relation: wire_index(f.relation),
+                    tuple: self.lift_row(&f.tuple)?,
+                })
+            })
+            .collect::<Result<Vec<_>, JsValue>>()?;
+        let mut offsets = Vec::with_capacity(provenance.len() + 1);
+        let mut support = Vec::new();
+        offsets.push(0);
+        for row in 0..provenance.len() {
+            let mut count = 0;
+            for justification in provenance.justifications(row) {
+                support.extend(justification.fact_ids().iter().map(|&f| wire_index(f)));
+                count += 1;
+            }
+            offsets.push(offsets[row] + count);
+        }
 
         let out = QueryResultOut {
             rows,
             truncated: results.is_truncated(),
-            provenance,
+            provenance: ProvenanceOut {
+                relations: provenance.relations().to_vec(),
+                atoms: provenance
+                    .atoms()
+                    .map(|name| {
+                        let i = provenance.relations().iter().position(|r| r == name);
+                        wire_index(i.unwrap_or(0))
+                    })
+                    .collect(),
+                facts,
+                truncated: provenance.is_truncated(),
+            },
         };
-        to_js(&out)
+        let js = to_js(&out)?;
+        let prov = js_sys::Reflect::get(&js, &JsValue::from_str("provenance"))?;
+        js_sys::Reflect::set(
+            &prov,
+            &JsValue::from_str("offsets"),
+            &js_sys::Uint32Array::from(offsets.as_slice()),
+        )?;
+        js_sys::Reflect::set(
+            &prov,
+            &JsValue::from_str("support"),
+            &js_sys::Uint32Array::from(support.as_slice()),
+        )?;
+        Ok(js)
     }
 }
 
@@ -309,32 +360,12 @@ impl FactEngine {
             }
         })
     }
+}
 
-    /// Lifts the provenance of one row into its serializable form.
-    fn lift_provenance(&self, rp: &fact_query::RowProvenance) -> Result<RowProvenanceOut, JsValue> {
-        let row = self.lift_row(&rp.row)?;
-        let justifications = rp
-            .justifications
-            .iter()
-            .map(|j| {
-                let support = j
-                    .support
-                    .iter()
-                    .map(|st| {
-                        Ok(SupportTupleOut {
-                            relation: st.relation.clone(),
-                            tuple: self.lift_row(&st.tuple)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, JsValue>>()?;
-                Ok(JustificationOut { support })
-            })
-            .collect::<Result<Vec<_>, JsValue>>()?;
-        Ok(RowProvenanceOut {
-            row,
-            justifications,
-        })
-    }
+/// An index as it crosses the boundary. Results are bounded far below
+/// `u32::MAX` by the caps.
+fn wire_index(i: usize) -> u32 {
+    u32::try_from(i).unwrap_or(u32::MAX)
 }
 
 /// Serializes a value to a `JsValue`, emitting `null` (not `undefined`) for a

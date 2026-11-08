@@ -72,8 +72,17 @@ const { rows, truncated, provenance } = engine.query(
 
 console.log(rows);       // [[1n, 2n], [2n, 3n], [1n, 3n]]
 console.log(truncated);  // false
-// provenance[i] explains rows[i]: the body facts that joined to yield it.
+// provenance.justifications(i) explains rows[i]: each justification is the
+// body facts that joined to yield it, one per atom in provenance.atoms.
 ```
+
+Provenance is normalized: each distinct supporting fact appears once in
+`provenance.facts`, and justifications refer to those same objects, so evidence
+shared by many rows is shipped and converted once. The raw form
+(`offsets` / `support` as `Uint32Array`s) is there too, for bulk processing.
+
+Pass caps as `engine.query(text, { maxRows, maxJustificationsPerRow })`
+(defaults 10 000 and 16), or a number as shorthand for `maxRows`.
 
 ### Grounding an LLM proposer
 
@@ -159,9 +168,12 @@ contract's guarantees failed:
 | `eval`   | Evaluation faulted — **indeterminate**, treat fail-closed.      |
 | `engine` | Building the engine, ingesting a fact, or running failed.       |
 
-`truncated === true` means evaluation stopped at the cardinality cap and the
-rows are a **prefix** — a first-class outcome, not an error. A decision keyed on
-"the result is empty" must distinguish this case. An `eval` fault **throws**
+`truncated === true` means the row cap was reached and the rows are a
+**prefix** — a first-class outcome, not an error. A decision keyed on "the
+result is empty" must distinguish this case. Separately,
+`provenance.truncated === true` means some row may have more justifications
+than were returned; the rows themselves are still complete unless `truncated`
+is also set. An `eval` fault **throws**
 (never returns an empty result), so a safety-conscious caller fails closed by
 construction.
 

@@ -12,6 +12,14 @@
 // Node, `workers.ts` for Cloudflare Workers) loads its own wasm-bindgen glue
 // and hands the generated class to `setBinding` before anything else runs.
 
+/** A cap as it crosses the boundary (a `u32`; larger values saturate). */
+function cap(n: number): number {
+  if (!Number.isInteger(n) || n < 0) {
+    throw new TypeError(`query cap must be a non-negative integer, got ${n}`);
+  }
+  return Math.min(n, 0xffff_ffff);
+}
+
 /** The instance surface of the wasm-bindgen-generated engine. */
 export interface InnerEngine {
   addFact(relation: string, values: unknown): void;
@@ -19,7 +27,7 @@ export interface InnerEngine {
   run(): void;
   schema(): unknown;
   check(text: string): void;
-  query(text: string, maxCardinality: number): unknown;
+  query(text: string, maxRows: number, maxJustificationsPerRow: number): unknown;
   free(): void;
 }
 
@@ -83,26 +91,48 @@ export interface Schema {
   readonly relations: RelationSchema[];
 }
 
-/** One supporting fact that participated in a justification. */
-export interface SupportTuple {
-  /** The relation the supporting fact belongs to. */
+/** One distinct supporting fact: a body fact that joined to produce a row. */
+export interface SupportFact {
+  /** The relation the fact belongs to. */
   readonly relation: string;
-  /** The supporting fact itself. */
+  /** The fact itself. */
   readonly tuple: FactValue[];
 }
 
-/** One way a row was produced: the body facts that joined to yield it. */
-export interface Justification {
-  /** The body facts that joined, in body order. */
-  readonly support: SupportTuple[];
-}
-
-/** The provenance of a single result row: the row plus every justification. */
-export interface RowProvenance {
-  /** The result row this provenance explains. */
-  readonly row: FactValue[];
-  /** Every justification for the row (at least one). */
-  readonly justifications: Justification[];
+/**
+ * Why each result row is there, normalized: every distinct supporting fact is
+ * stored once in {@link Provenance.facts}, and justifications refer to those
+ * same objects (compare with `===` to see that two rows share evidence).
+ *
+ * Every justification has exactly one supporting fact per positive body atom,
+ * in body order, so position `i` of a justification always comes from relation
+ * {@link Provenance.atoms}`[i]`.
+ */
+export interface Provenance {
+  /** The relation of each support column, one per positive body atom. */
+  readonly atoms: readonly string[];
+  /** Every distinct supporting fact, each once. */
+  readonly facts: readonly SupportFact[];
+  /**
+   * Whether some row may have justifications that were not returned (the
+   * per-row cap was reached, or the row cap stopped evaluation). `false` means
+   * every row's evidence is complete.
+   */
+  readonly truncated: boolean;
+  /**
+   * Row `row`'s justifications (aligned with {@link QueryResult.rows}): each an
+   * array of supporting facts, one per atom. Empty for an out-of-range row.
+   */
+  justifications(row: number): SupportFact[][];
+  /**
+   * The raw normalized form: row `r`'s justifications are
+   * `offsets[r]..offsets[r + 1]`, and justification `j`'s facts are the indices
+   * `support[j * k..(j + 1) * k]` into {@link Provenance.facts}, with
+   * `k = atoms.length`.
+   */
+  readonly offsets: Uint32Array;
+  /** See {@link Provenance.offsets}. */
+  readonly support: Uint32Array;
 }
 
 /** The result of {@link FactEngine.query}. */
@@ -110,13 +140,25 @@ export interface QueryResult {
   /** The distinct result rows. */
   readonly rows: FactValue[][];
   /**
-   * Whether evaluation stopped at the cardinality cap. When `true` the rows are
-   * a prefix of the full result — a first-class outcome, not an error. A
-   * decision keyed on "the result is empty" must distinguish this case.
+   * Whether more rows may exist than were returned (the row cap was reached).
+   * When `true` the rows are a prefix of the full result — a first-class
+   * outcome, not an error. A decision keyed on "the result is empty" must
+   * distinguish this case.
    */
   readonly truncated: boolean;
-  /** One {@link RowProvenance} per row, aligned by index with {@link rows}. */
-  readonly provenance: RowProvenance[];
+  /** The rows' provenance, aligned by index with {@link QueryResult.rows}. */
+  readonly provenance: Provenance;
+}
+
+/**
+ * The two independent caps on {@link FactEngine.query}: at most `maxRows`
+ * rows, each keeping at most `maxJustificationsPerRow` justifications.
+ */
+export interface QueryLimits {
+  /** Row cap (default {@link DEFAULT_MAX_ROWS}). */
+  readonly maxRows?: number;
+  /** Per-row justification cap (default {@link DEFAULT_MAX_JUSTIFICATIONS_PER_ROW}). */
+  readonly maxJustificationsPerRow?: number;
 }
 
 /**
@@ -146,25 +188,31 @@ export class FactQueryError extends Error {
   }
 }
 
-/** The default cardinality cap when {@link FactEngine.query} is called without one. */
-export const DEFAULT_MAX_CARDINALITY = 10_000;
+/** The default row cap for {@link FactEngine.query}. */
+export const DEFAULT_MAX_ROWS = 10_000;
+
+/** The default per-row justification cap for {@link FactEngine.query}. */
+export const DEFAULT_MAX_JUSTIFICATIONS_PER_ROW = 16;
+
+/** @deprecated Use {@link DEFAULT_MAX_ROWS}. */
+export const DEFAULT_MAX_CARDINALITY = DEFAULT_MAX_ROWS;
 
 // --- The wire representation crossing the wasm boundary ----------------------
 
 type WireValue = { Int: string } | { Bool: boolean } | { Sym: string };
 
-interface WireSupport {
-  relation: string;
-  tuple: WireValue[];
-}
 interface WireProvenance {
-  row: WireValue[];
-  justifications: { support: WireSupport[] }[];
+  relations: string[];
+  atoms: number[];
+  facts: { relation: number; tuple: WireValue[] }[];
+  truncated: boolean;
+  offsets: Uint32Array;
+  support: Uint32Array;
 }
 interface WireResult {
   rows: WireValue[][];
   truncated: boolean;
-  provenance: WireProvenance[];
+  provenance: WireProvenance;
 }
 
 function toWire(value: FactValueInput): WireValue {
@@ -195,19 +243,47 @@ function fromWire(wire: WireValue): FactValue {
   return wire.Sym;
 }
 
+class ProvenanceView implements Provenance {
+  readonly atoms: readonly string[];
+  readonly facts: readonly SupportFact[];
+  readonly truncated: boolean;
+  readonly offsets: Uint32Array;
+  readonly support: Uint32Array;
+
+  constructor(raw: WireProvenance) {
+    this.atoms = raw.atoms.map((a) => raw.relations[a]);
+    // Each distinct fact is converted once; justifications share these objects.
+    this.facts = raw.facts.map((f) => ({
+      relation: raw.relations[f.relation],
+      tuple: f.tuple.map(fromWire),
+    }));
+    this.truncated = raw.truncated;
+    this.offsets = raw.offsets;
+    this.support = raw.support;
+  }
+
+  justifications(row: number): SupportFact[][] {
+    if (!Number.isInteger(row) || row < 0 || row + 1 >= this.offsets.length) {
+      return [];
+    }
+    const k = this.atoms.length;
+    const out: SupportFact[][] = [];
+    for (let j = this.offsets[row]; j < this.offsets[row + 1]; j++) {
+      const facts: SupportFact[] = new Array(k);
+      for (let i = 0; i < k; i++) {
+        facts[i] = this.facts[this.support[j * k + i]];
+      }
+      out.push(facts);
+    }
+    return out;
+  }
+}
+
 function liftResult(raw: WireResult): QueryResult {
   return {
     rows: raw.rows.map((row) => row.map(fromWire)),
     truncated: raw.truncated,
-    provenance: raw.provenance.map((rp) => ({
-      row: rp.row.map(fromWire),
-      justifications: rp.justifications.map((j) => ({
-        support: j.support.map((st) => ({
-          relation: st.relation,
-          tuple: st.tuple.map(fromWire),
-        })),
-      })),
-    })),
+    provenance: new ProvenanceView(raw.provenance),
   };
 }
 
@@ -313,14 +389,20 @@ export class FactEngine {
 
   /**
    * Parses, form-checks, and evaluates `text` read-only against the current
-   * fixed point, capped at `maxCardinality` solutions.
+   * fixed point, under two independent caps: at most `maxRows` rows, each
+   * keeping at most `maxJustificationsPerRow` justifications. Pass a number as
+   * shorthand for `{ maxRows }`.
    *
    * @throws {@link FactQueryError} with stage `parse`, `schema`, `unsafe`, or
    * `eval`. An `eval` fault is indeterminate — treat the thrown error
    * fail-closed, never as an empty result.
    */
-  query(text: string, maxCardinality: number = DEFAULT_MAX_CARDINALITY): QueryResult {
-    const raw = wrap(() => this.#inner.query(text, maxCardinality)) as WireResult;
+  query(text: string, limits: number | QueryLimits = {}): QueryResult {
+    const { maxRows = DEFAULT_MAX_ROWS, maxJustificationsPerRow = DEFAULT_MAX_JUSTIFICATIONS_PER_ROW } =
+      typeof limits === "number" ? { maxRows: limits } : limits;
+    const raw = wrap(() =>
+      this.#inner.query(text, cap(maxRows), cap(maxJustificationsPerRow)),
+    ) as WireResult;
     return liftResult(raw);
   }
 

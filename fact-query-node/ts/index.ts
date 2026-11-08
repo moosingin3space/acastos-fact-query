@@ -27,7 +27,7 @@
  *   "(x, z) <-- edge(x, y), edge(y, z)",
  * );
  * // rows === [[1n, 3n]], truncated === false
- * // provenance[0].justifications[0].support has the two edges that joined.
+ * // provenance.justifications(0)[0] holds the two edges that joined.
  * ```
  *
  * @packageDocumentation
@@ -40,6 +40,8 @@ setBinding(WasmFactEngine);
 
 export {
   DEFAULT_MAX_CARDINALITY,
+  DEFAULT_MAX_JUSTIFICATIONS_PER_ROW,
+  DEFAULT_MAX_ROWS,
   FactEngine,
   FactQueryError,
 } from "./core.js";
@@ -47,11 +49,11 @@ export type {
   ColumnType,
   FactValue,
   FactValueInput,
-  Justification,
+  Provenance,
+  QueryLimits,
   QueryResult,
   RelationSchema,
-  RowProvenance,
   Schema,
   Stage,
-  SupportTuple,
+  SupportFact,
 } from "./core.js";
