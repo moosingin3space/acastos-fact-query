@@ -23,6 +23,7 @@
 //! assert_eq!(engine.query("path").len(), 3);
 //! ```
 
+mod compile;
 pub mod eval;
 pub mod expr;
 #[cfg(feature = "arbitrary")]
@@ -30,6 +31,7 @@ pub mod fuzz;
 pub mod ir;
 pub mod parser;
 mod stack;
+mod table;
 pub mod value;
 
 use std::collections::HashMap;

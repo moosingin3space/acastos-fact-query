@@ -5,6 +5,8 @@
 //!
 //! - `expr_soundness`: the interpreter is type-sound on random well-typed
 //!   expressions.
+//! - `bytecode_matches_tree`: compiled slot bytecode agrees exactly with the
+//!   tree-walking interpreter.
 //! - `seminaive_oracle`: the semi-naïve evaluator vs a naïve reference loop,
 //!   over random programs (including an incremental second run).
 //! - `macro_*` tests: random EDB facts over the fixed fixtures, compared to the
@@ -36,6 +38,11 @@ fn int(v: &Value) -> i64 {
 #[test]
 fn expr_soundness() {
     arbtest::arbtest(fuzz::expr_soundness);
+}
+
+#[test]
+fn bytecode_matches_tree() {
+    arbtest::arbtest(fuzz::bytecode_matches_tree);
 }
 
 #[test]

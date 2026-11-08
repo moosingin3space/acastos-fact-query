@@ -20,6 +20,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use arbitrary::{Result, Unstructured};
 
+use crate::compile::{Code, Scope};
 use crate::eval::{self, Database, EvalError};
 use crate::expr::{BinOp, Expr, ExprError, UnOp};
 use crate::ir::{
@@ -160,6 +161,45 @@ pub fn expr_soundness(u: &mut Unstructured) -> Result<()> {
         Err(ExprError::Arithmetic(_)) => {}
         Err(e) => panic!("unsound evaluation of {expr:?} with {env:?}: {e}"),
     }
+    Ok(())
+}
+
+/// Generates a random expression and environment, compiles the expression to
+/// slot bytecode, and asserts the bytecode agrees exactly — value or error —
+/// with the tree-walking [`Expr::eval`] oracle. Sometimes one variable is left
+/// out of scope, exercising lazily-raised unbound-variable errors through
+/// short-circuiting `&&` / `||`.
+///
+/// # Errors
+///
+/// Returns an [`arbitrary::Error`] only if the byte source is exhausted.
+///
+/// # Panics
+///
+/// Panics if the bytecode and the tree walk disagree.
+pub fn bytecode_matches_tree(u: &mut Unstructured) -> Result<()> {
+    let (expr, mut env) = arb_expr_and_env(u)?;
+    let mut vars: Vec<Symbol> = env.keys().copied().collect();
+    vars.sort_unstable_by_key(|s| s.0);
+    if !vars.is_empty() && u.ratio(1_u8, 4_u8)? {
+        let dropped = vars.remove(u.choose_index(vars.len())?);
+        env.remove(&dropped);
+    }
+    let mut scope = Scope::default();
+    let mut next = 0;
+    let mut slots = Vec::new();
+    for s in &vars {
+        scope.bind_fresh(*s, &mut next);
+        slots.push(env[s]);
+    }
+    let code = Code::compile(&expr, &scope)
+        .unwrap_or_else(|e| panic!("generated expression failed to compile: {e} in {expr:?}"));
+    let via_code = code.run(&slots, &mut Vec::new());
+    let via_tree = expr.eval(&env);
+    assert_eq!(
+        via_code, via_tree,
+        "bytecode/tree disagree on {expr:?} with {env:?}"
+    );
     Ok(())
 }
 

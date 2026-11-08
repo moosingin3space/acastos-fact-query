@@ -79,3 +79,33 @@ fn accepts_stratified_negation() {
     r.sort();
     assert_eq!(r, vec![vec![Value::Int(-1)], vec![Value::Int(0)]]);
 }
+
+/// A `let` shadows an outer variable for the rest of the body (Ascent's, and
+/// Rust's, scoping): later clauses see the new value, earlier ones keep theirs,
+/// and backtracking into an earlier clause sees the original binding again.
+#[test]
+fn let_shadows_for_the_rest_of_the_body() {
+    let mut engine = Engine::from_source(
+        "relation a(int);
+         relation b(int);
+         relation out(int, int);
+         out(x, y) <-- a(x), b(x), let y = x, let x = x + 10;",
+    )
+    .unwrap();
+    for v in [1, 2] {
+        engine.add_fact("a", vec![Value::Int(v)]).unwrap();
+    }
+    for v in [1, 2, 3] {
+        engine.add_fact("b", vec![Value::Int(v)]).unwrap();
+    }
+    engine.run().unwrap();
+    let mut rows = engine.query("out");
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Int(11), Value::Int(1)],
+            vec![Value::Int(12), Value::Int(2)],
+        ]
+    );
+}

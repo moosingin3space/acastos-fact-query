@@ -260,7 +260,7 @@ impl Expr {
     }
 }
 
-fn eval_binary(op: BinOp, a: Value, b: Value) -> Result<Value, ExprError> {
+pub(crate) fn eval_binary(op: BinOp, a: Value, b: Value) -> Result<Value, ExprError> {
     match op {
         BinOp::Add => Ok(Value::Int(as_int(&a)?.wrapping_add(as_int(&b)?))),
         BinOp::Sub => Ok(Value::Int(as_int(&a)?.wrapping_sub(as_int(&b)?))),
@@ -302,14 +302,14 @@ fn require(cond: bool, msg: &str) -> Result<(), ExprError> {
     }
 }
 
-fn as_int(v: &Value) -> Result<i64, ExprError> {
+pub(crate) fn as_int(v: &Value) -> Result<i64, ExprError> {
     match v {
         Value::Int(i) => Ok(*i),
         _ => Err(ExprError::TypeMismatch("expected int".to_owned())),
     }
 }
 
-fn as_bool(v: &Value) -> Result<bool, ExprError> {
+pub(crate) fn as_bool(v: &Value) -> Result<bool, ExprError> {
     match v {
         Value::Bool(b) => Ok(*b),
         _ => Err(ExprError::TypeMismatch("expected bool".to_owned())),
