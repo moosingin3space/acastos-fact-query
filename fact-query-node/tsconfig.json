@@ -11,5 +11,5 @@
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true
   },
-  "include": ["ts/**/*.ts"]
+  "files": ["ts/index.ts", "ts/core.ts"]
 }
