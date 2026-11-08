@@ -1,6 +1,9 @@
 # 0007: Serializing an engine to a re-materializable snapshot
 
 - **Status:** Proposed
+- **Revised by:** [0010](0010-retire-the-wasm-expression-tier.md) — there is no
+  wasm expression state to regenerate; the logical state (IR + interner +
+  database) is the whole engine
 - **Crate:** `ascent-jit` (inherited for free by `fact-query`; portable to the
   `wasm32` consumers `ascent-jit-web` / `fact-query-node`)
 - **Builds on:** [0001](0001-ascent-jit-runtime-engine.md) (the engine state and

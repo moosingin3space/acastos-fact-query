@@ -3,8 +3,10 @@
 //! `arbitrary` feature is on; the same generators drive the `cargo-fuzz`
 //! targets for longer, coverage-guided runs.
 //!
-//! - `*_oracle` tests: WASM tier vs the interpreter oracle, over random
-//!   expressions and random programs.
+//! - `expr_soundness`: the interpreter is type-sound on random well-typed
+//!   expressions.
+//! - `seminaive_oracle`: the semi-naïve evaluator vs a naïve reference loop,
+//!   over random programs (including an incremental second run).
 //! - `macro_*` tests: random EDB facts over the fixed fixtures, compared to the
 //!   real `ascent!` macro (the rules are compile-time, so only the facts vary).
 
@@ -32,13 +34,8 @@ fn int(v: &Value) -> i64 {
 }
 
 #[test]
-fn expr_oracle() {
-    arbtest::arbtest(fuzz::differential_expr);
-}
-
-#[test]
-fn program_oracle() {
-    arbtest::arbtest(fuzz::differential_program);
+fn expr_soundness() {
+    arbtest::arbtest(fuzz::expr_soundness);
 }
 
 #[test]

@@ -1,5 +1,5 @@
 //! Engine-level semantics tests that do not need the `ascent!` macro as an
-//! oracle: WASM-vs-interpreter agreement and load-time stratification checks.
+//! oracle: expression-heavy derivation and load-time stratification checks.
 
 use ascent_jit::{Engine, Value};
 
@@ -21,24 +21,28 @@ fn load_points(engine: &mut Engine) {
     }
 }
 
-/// The WASM expression tier must agree with the pure interpreter oracle on a
-/// program whose rules lean on arithmetic and comparison expressions.
+/// Arithmetic and comparison expressions in `if`/`let` clauses derive exactly
+/// the expected squared distances.
 #[test]
-fn wasm_agrees_with_interpreter() {
-    let mut wasm = Engine::from_source(DIST_SQ).unwrap();
-    load_points(&mut wasm);
-    wasm.run().unwrap();
+fn derives_expression_heavy_rule() {
+    let mut engine = Engine::from_source(DIST_SQ).unwrap();
+    load_points(&mut engine);
+    engine.run().unwrap();
 
-    let mut interp = Engine::from_source_interpreted(DIST_SQ).unwrap();
-    load_points(&mut interp);
-    interp.run().unwrap();
-
-    let mut wasm_rows = wasm.query("dist_sq");
-    let mut interp_rows = interp.query("dist_sq");
-    wasm_rows.sort();
-    interp_rows.sort();
-    assert_eq!(wasm_rows, interp_rows);
-    assert!(!wasm_rows.is_empty());
+    let mut rows = engine.query("dist_sq");
+    rows.sort();
+    let expected: Vec<Vec<Value>> = [
+        (1, 2, 25),
+        (1, 3, 2),
+        (2, 1, 25),
+        (2, 3, 13),
+        (3, 1, 2),
+        (3, 2, 13),
+    ]
+    .into_iter()
+    .map(|(a, b, d)| vec![Value::Int(a), Value::Int(b), Value::Int(d)])
+    .collect();
+    assert_eq!(rows, expected);
 }
 
 /// A cycle through negation cannot be stratified and must be rejected when the

@@ -1,4 +1,5 @@
-//! Coverage-guided expression fuzzing: WASM tier vs interpreter oracle.
+//! Coverage-guided expression fuzzing: the interpreter is type-sound on
+//! random well-typed expressions.
 
 #![no_main]
 
@@ -7,5 +8,5 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let mut u = Unstructured::new(data);
-    let _ = ascent_jit::fuzz::differential_expr(&mut u);
+    let _ = ascent_jit::fuzz::expr_soundness(&mut u);
 });

@@ -81,30 +81,4 @@ impl Value {
             Value::Sym(_) => Type::Sym,
         }
     }
-
-    /// Encodes this value into the `i64` representation used by the WASM
-    /// expression tier. Equality on the bit pattern matches equality on the
-    /// value for every variant (interned ids compare equal iff equal).
-    #[must_use]
-    pub fn to_bits(self) -> i64 {
-        match self {
-            Value::Int(i) => i,
-            Value::Bool(b) => i64::from(b),
-            Value::Sym(s) => i64::from(s.0),
-        }
-    }
-
-    /// Decodes an `i64` produced by the WASM tier back into a value of `ty`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `ty` is [`Type::Sym`] and `bits` is not a valid symbol id.
-    #[must_use]
-    pub fn from_bits(bits: i64, ty: Type) -> Value {
-        match ty {
-            Type::Int => Value::Int(bits),
-            Type::Bool => Value::Bool(bits != 0),
-            Type::Sym => Value::Sym(Symbol(u32::try_from(bits).expect("symbol id out of range"))),
-        }
-    }
 }

@@ -12,8 +12,8 @@ wanted. It checks *form*, not *meaning*: a query can parse, type-check, run, and
 return a clean result that does not answer the question asked. **Provenance is
 the one bridge** the substrate offers against that.
 
-Evaluation runs entirely in **WebAssembly** (the engine's expression tier on the
-host's own `WebAssembly` engine), so there is no native `wasmtime` dependency.
+Evaluation runs entirely in **WebAssembly**: the engine — a pure interpreter —
+is compiled into the package's wasm module, so there is no native dependency.
 Nothing here carries policy, an LLM, or a commit path — that is the
 governance-free guarantee, layered on *top* by your application.
 
@@ -90,23 +90,6 @@ This binding was built to drop a deterministic, provenance-carrying verifier
 underneath an LLM loop (e.g. the OpenRouter Agents SDK): the model proposes a
 query, you `check()` it cheaply, `query()` it under a bound, and show the
 `provenance` as the evidence a human or a vote signs off on.
-
-### Choosing the expression evaluator
-
-`fromSource` takes an optional second argument selecting how `if`/`let`/head
-expressions run — the relational core and all semantics are identical either
-way (the interpreter is the differential oracle the wasm path is pinned to):
-
-```ts
-const engine = FactEngine.fromSource(src, "interpreted");
-```
-
-- `"wasm"` (default) — a nested `WebAssembly` module via the host engine.
-  Every expression call crosses the JS boundary.
-- `"interpreted"` — a pure tree-walk, in-substrate, zero boundary crossings.
-  Measured faster under Node on every benchmarked workload (up to ~13× on
-  expression-heavy programs; see `npm run bench` and
-  [`docs/0008`](../docs/0008-benchmarks-and-the-join-jit-deferral.md)).
 
 ## The value model
 

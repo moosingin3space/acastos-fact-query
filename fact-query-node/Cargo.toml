@@ -12,11 +12,10 @@ readme = "README.md"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# `default-features = false` everywhere: no native `wasmtime`. The expression
-# tier runs on the host `WebAssembly` engine via `ascent-jit-web`'s executor.
+# The engine is a pure interpreter (ADR 0010), so it compiles straight into this
+# wasm module; nothing else evaluates expressions.
 ascent-jit = { path = "../ascent-jit", default-features = false }
 fact-query = { path = "../fact-query", default-features = false }
-ascent-jit-web = { path = "../ascent-jit-web" }
 # Pinned exact so the generated glue matches the `wasm-bindgen` CLI used to build
 # (`wasm-bindgen --target nodejs`); a mismatch is a hard, confusing failure.
 wasm-bindgen = "=0.2.126"
@@ -25,9 +24,9 @@ serde = { version = "1", features = ["derive"] }
 serde-wasm-bindgen = "0.6"
 
 [lints.rust]
-# Mirrors `ascent-jit-web`: `unsafe` is forbidden, every public item is
-# documented. (The full pedantic workspace lint set does not reach here because,
-# like `ascent-jit-web`, this crate is detached from the parent workspace.)
+# `unsafe` is forbidden and every public item is documented. (The full pedantic
+# workspace lint set does not reach here because this crate is detached from
+# the parent workspace.)
 unsafe_code = "forbid"
 missing_docs = "deny"
 
@@ -37,5 +36,5 @@ pedantic = { priority = -1, level = "deny" }
 
 # Detached from the parent workspace: this crate is wasm32-only and is built
 # separately (`cargo build -p fact-query-node --target wasm32-unknown-unknown`),
-# mirroring how `ascent-jit-web` and `ascent-jit/fuzz` detach.
+# mirroring how `ascent-jit/fuzz` detaches.
 [workspace]

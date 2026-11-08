@@ -6,27 +6,25 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "A runtime interpreter for Ascent Datalog programs supplied as data, with a sandboxed WebAssembly expression tier, provenance, and speculative evaluation."
-keywords = ["datalog", "ascent", "wasm", "interpreter", "logic"]
+description = "A runtime interpreter for Ascent Datalog programs supplied as data, with semi-naive indexed evaluation, provenance, and speculative evaluation."
+keywords = ["datalog", "ascent", "interpreter", "logic"]
 categories = ["compilers", "data-structures"]
 readme = "../README.md"
 
 [dependencies]
-wasm-encoder = "0.253"
-wasmtime = { version = "47", default-features = false, features = ["cranelift", "runtime"], optional = true }
 arbitrary = { version = "1.4", optional = true }
 
+# Grows the stack on demand in the engine's recursive walks (see `stack.rs`).
+# Native-only: on `wasm32` stacker cannot find the stack limit and would
+# allocate a fresh stack on every guarded call, so there the expression depth
+# limit is the only defence (and a wasm stack overflow is a trap, not UB).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+stacker = "0.1.25"
+
 [features]
-default = ["wasmtime"]
-# The default native expression executor (`WasmtimeExecutor`). Optional so the
-# crate builds for `wasm32` targets that supply their own `WasmExecutor` (e.g. a
-# browser host over the platform `WebAssembly` engine). The pure-interpreter and
-# module-encoding paths do not need it.
-wasmtime = ["dep:wasmtime"]
 # Enables the `fuzz` module: `arbitrary`-based generators and differential
 # checkers shared by the in-tree `arbtest` tests and the `cargo-fuzz` targets.
-# Pulls in `wasmtime` because the differential oracle runs the wasm executor.
-arbitrary = ["dep:arbitrary", "wasmtime"]
+arbitrary = ["dep:arbitrary"]
 
 [dev-dependencies]
 ascent = "0.8"

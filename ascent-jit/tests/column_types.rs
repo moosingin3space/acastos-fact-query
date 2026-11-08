@@ -9,7 +9,7 @@ use ascent_jit::eval::EvalError;
 use ascent_jit::{Engine, Error, Value};
 
 fn engine() -> Engine {
-    Engine::from_source_interpreted(
+    Engine::from_source(
         "relation node(sym, int);
          relation reachable(sym, int);
          reachable(x, n) <-- node(x, n);",

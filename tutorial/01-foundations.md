@@ -19,9 +19,9 @@ one of three things:
 That is the whole type system. There is no string-with-operations, no list, no
 record, no null. The reason is spelled out in
 [docs/0003](../docs/0003-external-fact-sources.md): the closed, `Copy` value
-model is what lets the engine hash tuples cheaply, bridge expressions through a
-single `i64` into its WebAssembly tier, and check itself against a pure
-reference interpreter. Widening it would break all three. So rich data does not
+model is what lets the engine hash and index tuples cheaply, keep its
+expression interpreter small and total, and check itself against the `ascent!`
+macro. Widening it would break all three. So rich data does not
 get a new type — it gets **lowered** into these three kinds. Learning to do that
 lowering well is the entire skill, and Parts 2 and 3 are about little else.
 

@@ -1,6 +1,6 @@
 # 0004: A pluggable WebAssembly execution tier
 
-- **Status:** Proposed
+- **Status:** Superseded by [0010](0010-retire-the-wasm-expression-tier.md)
 - **Crate:** `ascent-jit` (with a `wasm32` consumer crate, `ascent-jit-web`)
 - **Builds on:** [0001](0001-ascent-jit-runtime-engine.md) (the WebAssembly
   expression tier)

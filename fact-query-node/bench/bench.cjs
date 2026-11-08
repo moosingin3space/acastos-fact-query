@@ -1,18 +1,11 @@
 "use strict";
 
 /**
- * Benchmark: the two expression evaluators exposed by `FactEngine.fromSource`.
- *
- *   - "wasm"        — expressions run on the host's WebAssembly engine via the
- *                     nested WebExecutor (substrate-wasm -> JS -> inner wasm).
- *   - "interpreted" — expressions run in-substrate by the pure tree-walk
- *                     interpreter, with zero JS-boundary crossings.
- *
- * Hypothesis under test (ADR 0006): in the Node deployment the whole substrate
- * is already wasm, so the nested-wasm expression tier pays a boundary cost per
- * expression call that the in-substrate interpreter avoids. We expect the
- * interpreter to win on expression-heavy work and to roughly tie on work with
- * no expressions (pure joins).
+ * Benchmark: the engine under Node, on three workloads — a join-heavy
+ * fixed point (transitive closure), an expression-heavy fixed point, and a
+ * read-only conjunctive query. (ADR 0008 used this suite to compare the
+ * retired nested-wasm expression tier against the interpreter; ADR 0010
+ * retired the former.)
  *
  * Methodology: warmup runs, then >=10 timed iterations per case with
  * performance.now(); report median and spread (min/max). A fresh engine is
@@ -24,7 +17,6 @@ const { FactEngine } = require("../dist/index.js");
 
 const WARMUP = 3;
 const ITERS = 12;
-const EVALUATORS = ["wasm", "interpreted"];
 
 /** Median of a numeric array (linear interpolation for even length). */
 function median(xs) {
@@ -82,11 +74,11 @@ function chainEdges(n) {
   return facts;
 }
 
-function benchTransitiveClosure(evaluator, n) {
+function benchTransitiveClosure(n) {
   const facts = chainEdges(n);
   return measure(
     () => {
-      const e = FactEngine.fromSource(TC_SRC, evaluator);
+      const e = FactEngine.fromSource(TC_SRC);
       e.addFacts(facts);
       return e;
     },
@@ -98,8 +90,7 @@ function benchTransitiveClosure(evaluator, n) {
 // --- Workload (b): expression-heavy run() (chained if + let, minimal join) ---
 
 // One relation, no join; each fact fires a rule with a chain of `if` filters
-// and `let` arithmetic, so the expression tier dominates. Every `if` and `let`
-// is a separate expression the tier evaluates (a boundary crossing under wasm).
+// and `let` arithmetic, so expression evaluation dominates.
 const EXPR_SRC =
   "relation num(int);" +
   "relation derived(int, int);" +
@@ -122,11 +113,11 @@ function exprFacts(n) {
   return facts;
 }
 
-function benchExpressionHeavy(evaluator, n) {
+function benchExpressionHeavy(n) {
   const facts = exprFacts(n);
   return measure(
     () => {
-      const e = FactEngine.fromSource(EXPR_SRC, evaluator);
+      const e = FactEngine.fromSource(EXPR_SRC);
       e.addFacts(facts);
       return e;
     },
@@ -146,8 +137,8 @@ const Q_K = 40;
 const QUERY_TEXT = "(i, j) <-- link(i, m), tag(m, j), if i < j";
 const QUERY_CAP = 1_000_000;
 
-function buildQueryEngine(evaluator) {
-  const e = FactEngine.fromSource(QUERY_SRC, evaluator);
+function buildQueryEngine() {
+  const e = FactEngine.fromSource(QUERY_SRC);
   const link = [];
   for (let i = 0; i < Q_N; i++) {
     link.push({ relation: "link", values: [i, i % Q_D] });
@@ -164,8 +155,8 @@ function buildQueryEngine(evaluator) {
   return e;
 }
 
-function benchQuery(evaluator) {
-  const engine = buildQueryEngine(evaluator);
+function benchQuery() {
+  const engine = buildQueryEngine();
   const result = engine.query(QUERY_TEXT, QUERY_CAP);
   const rowCount = result.rows.length;
   const truncated = result.truncated;
@@ -185,72 +176,33 @@ function fmt(ms) {
   return ms.toFixed(3).padStart(9);
 }
 
-function reportPair(label, byEval) {
-  const w = byEval.wasm;
-  const i = byEval.interpreted;
-  const ratio = i.median / w.median;
+function report(label, s) {
   console.log(
-    `  ${label.padEnd(34)} ` +
-      `wasm ${fmt(w.median)}ms [${fmt(w.min)}, ${fmt(w.max)}]   ` +
-      `interp ${fmt(i.median)}ms [${fmt(i.min)}, ${fmt(i.max)}]   ` +
-      `interp/wasm ${ratio.toFixed(3)}`,
+    `  ${label.padEnd(34)} ${fmt(s.median)}ms [${fmt(s.min)}, ${fmt(s.max)}]`,
   );
-  return { label, wasm: w.median, interpreted: i.median, ratio };
 }
 
 function main() {
   console.log(
-    `fact-query-node evaluator benchmark  (warmup=${WARMUP}, iters=${ITERS})\n` +
-      `node ${process.version}\n`,
+    `fact-query-node benchmark  (warmup=${WARMUP}, iters=${ITERS})\n` +
+      `node ${process.version}\n` +
+      "median ms [min, max]\n",
   );
-  const summary = [];
 
   console.log("(a) transitive closure run() over a chain graph");
-  for (const n of [8, 16, 32]) {
-    const byEval = {};
-    for (const ev of EVALUATORS) byEval[ev] = benchTransitiveClosure(ev, n);
-    summary.push(reportPair(`chain n=${n}`, byEval));
+  for (const n of [8, 16, 32, 64]) {
+    report(`chain n=${n}`, benchTransitiveClosure(n));
   }
 
   console.log("\n(b) expression-heavy run() (chained if + let arithmetic)");
-  {
-    const byEval = {};
-    for (const ev of EVALUATORS) byEval[ev] = benchExpressionHeavy(ev, EXPR_N);
-    summary.push(reportPair(`num facts=${EXPR_N}, 2 if + 5 let`, byEval));
-  }
+  report(`num facts=${EXPR_N}, 2 if + 5 let`, benchExpressionHeavy(EXPR_N));
 
   console.log("\n(c) query() over a materialized base (2-atom join + if)");
-  {
-    const byEval = {};
-    let meta = null;
-    for (const ev of EVALUATORS) {
-      const r = benchQuery(ev);
-      byEval[ev] = r.stats;
-      meta = r;
-    }
-    summary.push(
-      reportPair(
-        `join rows=${meta.rowCount}${meta.truncated ? " (truncated)" : ""}`,
-        byEval,
-      ),
-    );
-  }
-
-  console.log("\n=== summary: median ms, interpreted/wasm ratio ===");
-  console.log(
-    "workload".padEnd(38) +
-      "wasm(ms)".padStart(12) +
-      "interp(ms)".padStart(12) +
-      "ratio".padStart(10),
+  const q = benchQuery();
+  report(
+    `join rows=${q.rowCount}${q.truncated ? " (truncated)" : ""}`,
+    q.stats,
   );
-  for (const r of summary) {
-    console.log(
-      r.label.padEnd(38) +
-        r.wasm.toFixed(3).padStart(12) +
-        r.interpreted.toFixed(3).padStart(12) +
-        r.ratio.toFixed(3).padStart(10),
-    );
-  }
 }
 
 main();

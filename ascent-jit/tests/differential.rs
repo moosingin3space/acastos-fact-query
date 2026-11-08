@@ -1,5 +1,5 @@
 //! Differential tests: every major Ascent surface is run through both the real
-//! `ascent!` proc macro and the WASM-powered `ascent-jit` runtime, and their
+//! `ascent!` proc macro and the `ascent-jit` runtime interpreter, and their
 //! derived relations are asserted equal as sets.
 //!
 //! This is the load-bearing correctness check for the crate: the interpreter is

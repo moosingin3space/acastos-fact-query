@@ -9,9 +9,9 @@
 //! direction (this crate depends on `fact-query`, never the reverse, and on no
 //! application) is the governance-free guarantee.
 //!
-//! The expression tier runs on the **host's own `WebAssembly` engine** via
-//! [`ascent_jit_web`]'s `WebExecutor`, so there is no native `wasmtime`
-//! dependency: the whole substrate evaluates in place inside the wasm module.
+//! The engine is `ascent-jit`'s pure interpreter, compiled into this module, so
+//! the whole substrate — relational core and expressions alike — evaluates in
+//! place inside the wasm module with no further instantiation or JS crossings.
 //!
 //! # The boundary
 //!
@@ -118,8 +118,7 @@ struct QueryResultOut {
 
 /// A fact base that evaluates the `fact-query` queries grain inside wasm.
 ///
-/// Wraps an [`ascent_jit::Engine`] whose expression tier runs on the host
-/// `WebAssembly` engine. Build one with [`FactEngine::from_source`], populate it
+/// Wraps an [`ascent_jit::Engine`]. Build one with [`FactEngine::from_source`], populate it
 /// with [`add_fact`](FactEngine::add_fact) / [`add_facts`](FactEngine::add_facts)
 /// and [`run`](FactEngine::run), then query it with [`query`](FactEngine::query).
 #[wasm_bindgen]
@@ -130,41 +129,14 @@ pub struct FactEngine {
 
 #[wasm_bindgen]
 impl FactEngine {
-    /// Parses an Ascent program `src` and builds an engine over the chosen
-    /// expression evaluator.
-    ///
-    /// `evaluator` selects how `if` / `let` / head expressions are run:
-    ///
-    /// - `"wasm"` (the default when `evaluator` is absent) — the host's own
-    ///   `WebAssembly` engine, via [`ascent_jit_web`]'s `WebExecutor`. This
-    ///   nests a second `WebAssembly` instantiation inside the substrate wasm,
-    ///   with each expression call crossing the JS boundary (ADR 0006).
-    /// - `"interpreted"` — `ascent-jit`'s pure tree-walk interpreter, which runs
-    ///   in-substrate with no executor and no boundary crossing. Semantically
-    ///   identical (it is the differential oracle the wasm path is pinned to);
-    ///   it exists so callers can trade the boundary cost for interpretation
-    ///   cost when expressions dominate.
-    ///
-    /// Both paths evaluate the same queries grain and preserve the same
-    /// contract; only the expression tier differs.
+    /// Parses an Ascent program `src` and builds an engine over it.
     ///
     /// # Errors
     ///
-    /// Throws (stage `"engine"`) if `src` fails to parse or validate, or if
-    /// `evaluator` is neither `"wasm"` nor `"interpreted"`.
+    /// Throws (stage `"engine"`) if `src` fails to parse or validate.
     #[wasm_bindgen(js_name = fromSource)]
-    pub fn from_source(src: &str, evaluator: Option<String>) -> Result<FactEngine, JsValue> {
-        let engine = match evaluator.as_deref().unwrap_or("wasm") {
-            "wasm" => ascent_jit_web::engine_from_source(src),
-            "interpreted" => Engine::from_source_interpreted(src),
-            other => {
-                return Err(stage_error(
-                    "engine",
-                    &format!("unknown evaluator `{other}`; expected \"wasm\" or \"interpreted\""),
-                ));
-            }
-        }
-        .map_err(|e| stage_error("engine", &e.to_string()))?;
+    pub fn from_source(src: &str) -> Result<FactEngine, JsValue> {
+        let engine = Engine::from_source(src).map_err(|e| stage_error("engine", &e.to_string()))?;
         Ok(FactEngine { engine })
     }
 
