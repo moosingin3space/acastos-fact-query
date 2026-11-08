@@ -45,7 +45,7 @@ binding, or anything else.
 
 ```rust
 use ascent_jit::{Engine, Value};
-use fact_query::{Cardinality, FactStore};
+use fact_query::{FactStore, Limits};
 
 // The schema — relation declarations and rules — is the program.
 let mut engine = Engine::from_source("relation invocation(sym, int);").unwrap();
@@ -60,7 +60,7 @@ engine.run().unwrap();
 // read-only under a cardinality cap, returning rows with provenance.
 let q = engine.parse_query("(a) <-- invocation(a, 0)").unwrap();
 engine.check(&q).unwrap();
-let (results, _provenance) = engine.eval(&q, Cardinality::new(1_000)).unwrap();
+let (results, _provenance) = engine.eval(&q, Limits::rows(1_000)).unwrap();
 
 assert_eq!(results.rows().len(), 1);
 assert!(!results.is_truncated());

@@ -1,6 +1,9 @@
 # 0002: The `fact-query` proposer/verifier substrate
 
 - **Status:** Accepted
+- **Revised by:** [0013](0013-normalized-provenance-and-independent-caps.md)
+  (the single cardinality cap becomes independent row and per-row evidence
+  caps; provenance is normalized)
 - **Crate:** `fact-query`
 - **Builds on:** [0001](0001-ascent-jit-runtime-engine.md) — the engine
   capabilities this stands on: speculative `fork / assert / run / discard`

@@ -74,7 +74,7 @@ enters:
 
 ```rust
 use ascent_jit::{Engine, Value};
-use fact_query::{Cardinality, FactStore};
+use fact_query::{FactStore, Limits};
 
 // command, argument-string, exit-code — each a column.
 let mut engine = Engine::from_source("relation invocation(sym, sym, int);").unwrap();
@@ -91,7 +91,7 @@ engine.run().unwrap();
 // never needed the hand-entered `command` table, because it is derivable.
 let q = engine.parse_query("(cmd) <-- invocation(cmd, _, code), if code != 0").unwrap();
 engine.check(&q).unwrap();
-let (results, _) = engine.eval(&q, Cardinality::new(1_000)).unwrap();
+let (results, _) = engine.eval(&q, Limits::rows(1_000)).unwrap();
 assert_eq!(results.rows(), &[vec![Value::Sym(engine.intern("check"))]]);
 ```
 
@@ -118,7 +118,7 @@ rule — including the command, which is just position 0:
 
 ```rust
 use ascent_jit::{Engine, Value};
-use fact_query::{Cardinality, FactStore};
+use fact_query::{FactStore, Limits};
 
 let mut engine = Engine::from_source("
     relation arg(sym, int, sym);
@@ -139,7 +139,7 @@ engine.run().unwrap();
 // *can* cite the arg(argv, 0, cmd) fact as the reason: the relationship exists.
 let q = engine.parse_query("(argv, cmd) <-- uses_command(argv, cmd)").unwrap();
 engine.check(&q).unwrap();
-let (results, _) = engine.eval(&q, Cardinality::new(1_000)).unwrap();
+let (results, _) = engine.eval(&q, Limits::rows(1_000)).unwrap();
 assert_eq!(
     results.rows(),
     &[vec![Value::Sym(engine.intern(line)), Value::Sym(engine.intern("rename"))]],

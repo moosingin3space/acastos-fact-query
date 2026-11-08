@@ -109,7 +109,7 @@ legal argument:
 
 ```rust
 use ascent_jit::{Engine, Value};
-use fact_query::{Cardinality, FactStore};
+use fact_query::{FactStore, Limits};
 
 let mut engine = Engine::from_source("
     relation invocation(sym, int);
@@ -128,12 +128,12 @@ let q = engine
     .parse_query("(argv, m) <-- invocation(argv, code), output_contains(argv, m), if code != 0")
     .unwrap();
 engine.check(&q).unwrap();
-let (results, provenance) = engine.eval(&q, Cardinality::new(10_000)).unwrap();
+let (results, provenance) = engine.eval(&q, Limits::rows(10_000)).unwrap();
 
 assert_eq!(results.rows().len(), 1);
 assert!(!results.is_truncated());
 // Provenance says *why*: the invocation and output_contains facts that joined.
-assert_eq!(provenance.rows()[0].justifications[0].support.len(), 2);
+assert_eq!(provenance.justifications(0).next().unwrap().support().len(), 2);
 ```
 
 Three properties of this query are worth naming now, because the rest of the
@@ -145,8 +145,11 @@ guide leans on them:
   facts joined to produce it* — here, the specific `invocation` and
   `output_contains` tuples. Provenance is the engine's, and it is also your best
   tool for auditing whether your **model** is right (Part 3).
-- **It is cardinality-bounded.** Every query is capped on the number of
-  solutions. If the cap is hit, `results.is_truncated()` is `true` — a **surfaced
+- **It is cardinality-bounded.** Every query is capped on the number of rows
+  and, separately, on how many justifications each row keeps
+  (`Limits::rows(n)` uses a default of 16; `.with_justifications_per_row(m)`
+  changes it). If the row cap is hit, `results.is_truncated()` is `true`; if a
+  row's evidence was cut, `provenance.is_truncated()` is — each a **surfaced
   outcome, never a silent cut**. A bound that is hit and ignored is a
   memory-exhaustion bug; the contract makes you see it. (See the five guarantees
   in [`../fact-query/README.md`](../fact-query/README.md).)

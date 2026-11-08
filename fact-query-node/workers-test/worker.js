@@ -34,7 +34,9 @@ export default {
       return Response.json({
         rows: text(result.rows).sort(),
         truncated: result.truncated,
-        support: result.provenance.map((p) => p.justifications.length),
+        support: result.rows.map((_, r) => result.provenance.justifications(r).length),
+        atoms: result.provenance.atoms,
+        evidenceTruncated: result.provenance.truncated,
         schema: engine.schema().relations.map((r) => r.name),
         errorStage: stage,
       });

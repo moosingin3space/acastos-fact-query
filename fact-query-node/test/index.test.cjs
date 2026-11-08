@@ -29,10 +29,34 @@ test("transitive join returns rows with provenance", () => {
 
   assert.deepEqual(rows, [[1n, 3n]]);
   assert.equal(truncated, false);
-  assert.equal(provenance.length, 1);
-  assert.deepEqual(provenance[0].row, [1n, 3n]);
-  // The two edges that joined to yield the row.
-  assert.equal(provenance[0].justifications[0].support.length, 2);
+  assert.equal(provenance.truncated, false);
+  assert.deepEqual(provenance.atoms, ["edge", "edge"]);
+  // The two edges that joined to yield the row, in body order.
+  assert.deepEqual(provenance.justifications(0), [
+    [
+      { relation: "edge", tuple: [1n, 2n] },
+      { relation: "edge", tuple: [2n, 3n] },
+    ],
+  ]);
+  assert.deepEqual(provenance.justifications(1), [], "out of range");
+  engine.free();
+});
+
+test("provenance stores each supporting fact once", () => {
+  const engine = FactEngine.fromSource("relation edge(int, int);");
+  engine.addFacts([
+    { relation: "edge", values: [1n, 2n] },
+    { relation: "edge", values: [2n, 3n] },
+    { relation: "edge", values: [2n, 4n] },
+  ]);
+  engine.run();
+  // Both 2-hop paths go through edge(1, 2).
+  const { rows, provenance } = engine.query("(x, z) <-- edge(x, y), edge(y, z)");
+  assert.equal(rows.length, 2);
+  assert.equal(provenance.facts.length, 3);
+  const [first] = provenance.justifications(0);
+  const [second] = provenance.justifications(1);
+  assert.equal(first[0], second[0], "the shared edge is the same object");
   engine.free();
 });
 
@@ -69,9 +93,31 @@ test("truncation is a first-class outcome, not an error", () => {
     { relation: "edge", values: [1n, 4n] },
   ]);
   engine.run();
-  const { rows, truncated } = engine.query("(a, b) <-- edge(a, b)", 2);
+  const { rows, truncated, provenance } = engine.query("(a, b) <-- edge(a, b)", 2);
   assert.equal(rows.length, 2);
   assert.equal(truncated, true);
+  assert.equal(provenance.truncated, true, "evidence was not fully enumerated");
+});
+
+test("the row and evidence caps are independent", () => {
+  const engine = FactEngine.fromSource("relation edge(int, int);");
+  engine.addFacts([
+    { relation: "edge", values: [1n, 2n] },
+    { relation: "edge", values: [1n, 3n] },
+    { relation: "edge", values: [2n, 3n] },
+  ]);
+  engine.run();
+  const { rows, truncated, provenance } = engine.query("(a) <-- edge(a, _)", {
+    maxJustificationsPerRow: 1,
+  });
+  assert.equal(rows.length, 2);
+  assert.equal(truncated, false, "every row is present");
+  assert.equal(provenance.truncated, true, "row (1) lost a justification");
+  for (let r = 0; r < rows.length; r++) {
+    assert.equal(provenance.justifications(r).length, 1);
+  }
+  assert.throws(() => engine.query("(a) <-- edge(a, _)", -1), TypeError);
+  engine.free();
 });
 
 test("schema reports relations and column types", () => {

@@ -1,20 +1,19 @@
 //! The canonical [`FactStore`] implementation, over an `ascent-jit` [`Engine`].
 //!
 //! This is the one in-tree backend. It lowers a [`ConjunctiveQuery`] onto the
-//! engine's read-only ad-hoc query primitive and groups the per-join solutions
-//! it returns into distinct rows plus their provenance. It carries no policy:
+//! engine's read-only ad-hoc query primitive, which already groups solutions
+//! into distinct rows with normalized provenance, and resolves each distinct
+//! supporting fact once. It carries no policy:
 //! the `Engine` it borrows is just a fact base, and nothing here knows any
 //! application's denial, trust, or origin vocabulary — that layers on top.
 
-use std::collections::HashMap;
-
-use ascent_jit::{Engine, QueryOutput, Value};
+use ascent_jit::{Engine, QueryLimits, QueryOutput, Value};
 
 use crate::error::FactQueryError;
 use crate::query::ConjunctiveQuery;
-use crate::result::{Justification, Provenance, ResultSet, RowProvenance, SupportTuple};
+use crate::result::{Provenance, ResultSet, SupportFact};
 use crate::schema::{RelationSchema, Schema};
-use crate::{Cardinality, FactStore};
+use crate::{FactStore, Limits};
 
 impl FactStore for Engine {
     type Schema = Schema;
@@ -58,46 +57,67 @@ impl FactStore for Engine {
     fn eval(
         &mut self,
         query: &ConjunctiveQuery,
-        max: Cardinality,
+        limits: Limits,
     ) -> Result<(ResultSet, Provenance), FactQueryError> {
         let output = self
-            .evaluate_query(query.outputs(), query.body(), max.get())
+            .evaluate_query(
+                query.outputs(),
+                query.body(),
+                QueryLimits {
+                    max_rows: limits.max_rows(),
+                    max_justifications_per_row: limits.max_justifications_per_row(),
+                },
+            )
             .map_err(|e| FactQueryError::Eval(e.to_string()))?;
-        Ok(group(output))
+        Ok(lift(self, &output))
     }
 }
 
-/// Groups raw per-join solutions into distinct result rows (first-seen order)
-/// paired with index-aligned provenance — one [`Justification`] per join
-/// combination that produced the row.
-fn group(output: QueryOutput) -> (ResultSet, Provenance) {
-    let mut rows: Vec<Vec<Value>> = Vec::new();
-    let mut index: HashMap<Vec<Value>, usize> = HashMap::new();
-    let mut provs: Vec<RowProvenance> = Vec::new();
+/// Lifts the engine's grouped output into the substrate's result types,
+/// resolving each distinct supporting fact (once) from its handle.
+fn lift(engine: &Engine, output: &QueryOutput) -> (ResultSet, Provenance) {
+    let rows = output.rows().map(<[Value]>::to_vec).collect();
 
-    for solution in output.solutions {
-        let justification = Justification {
-            support: solution
-                .support
-                .into_iter()
-                .map(|(relation, tuple)| SupportTuple { relation, tuple })
-                .collect(),
-        };
-        if let Some(&i) = index.get(&solution.tuple) {
-            provs[i].justifications.push(justification);
-        } else {
-            let i = rows.len();
-            index.insert(solution.tuple.clone(), i);
-            rows.push(solution.tuple.clone());
-            provs.push(RowProvenance {
-                row: solution.tuple,
-                justifications: vec![justification],
-            });
+    let mut relations: Vec<String> = Vec::new();
+    let mut relation_index = |name: &str| -> usize {
+        relations.iter().position(|r| r == name).unwrap_or_else(|| {
+            relations.push(name.to_owned());
+            relations.len() - 1
+        })
+    };
+    let atoms: Vec<usize> = output.atoms().iter().map(|a| relation_index(a)).collect();
+    let facts: Vec<SupportFact> = output
+        .facts()
+        .iter()
+        .map(|&handle| {
+            // Every handle in a query output names a row of this engine.
+            let (relation, tuple) = engine.fact(handle).unwrap_or(("", &[]));
+            SupportFact {
+                relation: relation_index(relation),
+                tuple: tuple.to_vec(),
+            }
+        })
+        .collect();
+
+    let mut offsets = Vec::with_capacity(output.len() + 1);
+    let mut support = Vec::new();
+    offsets.push(0);
+    for row in 0..output.len() {
+        for justification in output.justifications(row) {
+            support.extend(justification.iter().map(|&f| f as usize));
         }
+        offsets.push(offsets[row] + output.justifications(row).len());
     }
 
     (
-        ResultSet::new(rows, output.truncated),
-        Provenance::new(provs),
+        ResultSet::new(rows, output.rows_truncated()),
+        Provenance::new(
+            relations,
+            atoms,
+            facts,
+            offsets,
+            support,
+            output.evidence_truncated(),
+        ),
     )
 }

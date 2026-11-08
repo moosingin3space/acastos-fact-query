@@ -13,7 +13,7 @@ use crate::compile::{Code, ColOp, Scope, SlotId, match_ops, match_row, negated_o
 use crate::expr::{Expr, ExprError};
 use crate::ir::{AggFunc, Arg, Atom, BodyClause, Program, RelationDecl, RelationKind, Rule};
 use crate::stack;
-use crate::table::{BitSet, KeyTable, hash_values, row_at};
+use crate::table::{BitSet, IdMap, KeyTable, hash_values, row_at};
 use crate::value::{Type, Value};
 
 /// An error raised during program validation or evaluation.
@@ -1000,16 +1000,6 @@ fn value_as_int(v: &Value) -> i64 {
     }
 }
 
-fn support_tuples(db: &Database, support: &[(usize, RowId)]) -> Vec<(String, Vec<Value>)> {
-    support
-        .iter()
-        .map(|&(rel, id)| {
-            let store = &db.relations[rel];
-            (store.name.clone(), store.row(id).to_vec())
-        })
-        .collect()
-}
-
 /// Evaluates each of `codes` into `out`.
 fn eval_into(
     codes: &[Code],
@@ -1308,15 +1298,63 @@ pub(crate) fn run_naive(program: &Program, db: &mut Database) -> Result<(), Eval
 
 // ----- provenance ----------------------------------------------------------
 
+/// An opaque handle to one stored fact: a relation and a row in its log.
+///
+/// Rows are only ever appended (a lattice tuple superseded by a joined value is
+/// marked dead, never moved or reused), so a handle stays valid, and keeps
+/// naming the same tuple, for the lifetime of the database it came from. It is
+/// meaningless for any other database, including a speculative fork's extra
+/// rows. Resolve one with [`crate::Engine::fact`]; chain explanations with
+/// [`crate::Engine::explain_fact`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FactRef {
+    relation: u32,
+    row: u32,
+}
+
+impl FactRef {
+    fn new(relation: usize, row: RowId) -> Self {
+        FactRef {
+            relation: rid(relation),
+            row: rid(row),
+        }
+    }
+
+    fn key(self) -> u64 {
+        (u64::from(self.relation) << 32) | u64::from(self.row)
+    }
+}
+
+impl Database {
+    /// Resolves a [`FactRef`] to its relation name and tuple, or `None` if the
+    /// handle does not name a row of this database. A lattice row superseded
+    /// since the handle was issued still resolves: it is the tuple that
+    /// participated.
+    #[must_use]
+    pub fn fact(&self, fact: FactRef) -> Option<(&str, &[Value])> {
+        let store = self.relations.get(fact.relation as usize)?;
+        let row = fact.row as usize;
+        (row < store.len()).then(|| (store.name.as_str(), store.row(row)))
+    }
+}
+
 /// A single one-step justification for a tuple: the rule that fired and the
-/// positive body tuples (its support) that satisfied it in the materialized
-/// database.
+/// positive body facts (its support) that satisfied it in the materialized
+/// database, in body order. Each support fact is a handle, so explanations can
+/// be chained by explaining a support fact in turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Derivation {
     /// Index into [`Program::rules`] of the rule that fired.
     pub rule: usize,
-    /// The positive body tuples that justified the firing, `(relation, tuple)`.
-    pub support: Vec<(String, Vec<Value>)>,
+    /// The positive body facts that justified the firing, in body order.
+    pub support: Vec<FactRef>,
+}
+
+fn handles(support: &[(usize, RowId)]) -> Vec<FactRef> {
+    support
+        .iter()
+        .map(|&(rel, id)| FactRef::new(rel, id))
+        .collect()
 }
 
 /// Matches each firing of one rule against a target tuple.
@@ -1333,7 +1371,7 @@ struct Explain<'t> {
 impl Sink for Explain<'_> {
     fn emit(
         &mut self,
-        db: &Database,
+        _db: &Database,
         env: &[Value],
         stack: &mut Vec<Value>,
         support: &[(usize, RowId)],
@@ -1354,7 +1392,7 @@ impl Sink for Explain<'_> {
             if matches {
                 self.out.push(Derivation {
                     rule: self.rule,
-                    support: support_tuples(db, support),
+                    support: handles(support),
                 });
             }
         }
@@ -1364,7 +1402,7 @@ impl Sink for Explain<'_> {
 
 /// Finds one-step derivations of `tuple` in `relation` against the materialized
 /// `db`: every rule whose head produces `tuple`, paired with the positive body
-/// tuples that justify it. Justifications are recomputed on demand, so there is
+/// facts that justify it. Justifications are recomputed on demand, so there is
 /// no per-run tracking cost (provenance is "toggleable" by simply not calling
 /// this).
 ///
@@ -1424,68 +1462,241 @@ pub fn explain(
 
 // ----- the queries grain ---------------------------------------------------
 
-/// One solution to an ad-hoc conjunctive query against the current materialized
-/// database: the output tuple plus the positive body tuples that justified it
-/// (its provenance). Two distinct join combinations that yield the same output
-/// tuple appear as two solutions — grouping into distinct rows is left to the
-/// caller, who needs the per-combination support to do it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QuerySolution {
-    /// The output tuple, one value per output expression.
-    pub tuple: Vec<Value>,
-    /// The positive body tuples that justified this solution, `(relation, tuple)`.
-    pub support: Vec<(String, Vec<Value>)>,
+/// The two independent caps on an ad-hoc query.
+///
+/// Rows and evidence are bounded separately, so a caller can tell "these are
+/// not all the answers" apart from "these are all the answers, but not all the
+/// reasons". Together they bound the output's size: at most `max_rows` rows,
+/// each with at most `max_justifications_per_row` justifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryLimits {
+    /// At most this many distinct result rows.
+    pub max_rows: usize,
+    /// At most this many justifications (join combinations) kept per row.
+    pub max_justifications_per_row: usize,
 }
 
-/// The outcome of an ad-hoc conjunctive query: the solutions found and whether
-/// the cardinality cap was reached. When `truncated` is true the solution list
-/// is a prefix of the full result set, not the whole of it — a first-class
-/// outcome the caller must surface, never an error.
+/// One justification's support: an index into [`QueryOutput::facts`] per
+/// positive body atom, in body order (see [`QueryOutput::atoms`]).
+pub type Support<'a> = &'a [u32];
+
+/// The outcome of an ad-hoc conjunctive query: its distinct rows (first-seen
+/// order) and their provenance, in a flat, normalized form.
+///
+/// Every justification has exactly one supporting fact per positive body
+/// atom, so the relation of support column `i` is [`QueryOutput::atoms`]`[i]`
+/// for every justification. Supporting facts are stored once, as handles, in
+/// [`QueryOutput::facts`]; a justification refers to them by index.
+///
+/// Both truncation flags mean *may be incomplete*; `false` means complete. If
+/// the row cap stops evaluation, both are set, because the evidence for the
+/// rows already found was not fully enumerated either.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryOutput {
-    /// The solutions found, at most `max` of them.
-    pub solutions: Vec<QuerySolution>,
-    /// True if evaluation stopped at the cardinality cap.
-    pub truncated: bool,
+    arity: usize,
+    len: usize,
+    rows: Vec<Value>,
+    atoms: Vec<String>,
+    facts: Vec<FactRef>,
+    /// Row `r`'s justifications are `offsets[r]..offsets[r + 1]`.
+    offsets: Vec<u32>,
+    /// Justification `j`'s support is `support[j * k..(j + 1) * k]`, `k = atoms.len()`.
+    support: Vec<u32>,
+    rows_truncated: bool,
+    evidence_truncated: bool,
 }
 
-/// Collects every solution, up to the cardinality cap.
+impl QueryOutput {
+    /// The number of distinct result rows.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether there are no result rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Result row `i`, if it exists.
+    #[must_use]
+    pub fn row(&self, i: usize) -> Option<&[Value]> {
+        (i < self.len).then(|| &self.rows[i * self.arity..(i + 1) * self.arity])
+    }
+
+    /// Every result row, in first-seen order.
+    #[must_use = "the iterator borrows the rows; iterate it"]
+    pub fn rows(&self) -> impl ExactSizeIterator<Item = &[Value]> {
+        (0..self.len).map(|i| &self.rows[i * self.arity..(i + 1) * self.arity])
+    }
+
+    /// The relation of each support column: one entry per positive body atom,
+    /// in body order.
+    #[must_use]
+    pub fn atoms(&self) -> &[String] {
+        &self.atoms
+    }
+
+    /// Every distinct supporting fact, each once. Resolve with
+    /// [`crate::Engine::fact`].
+    #[must_use]
+    pub fn facts(&self) -> &[FactRef] {
+        &self.facts
+    }
+
+    /// Row `i`'s justifications, each a [`Support`] (indices into
+    /// [`QueryOutput::facts`], one per atom). Empty if `i` is out of range.
+    #[must_use = "the iterator borrows the justifications; iterate it"]
+    pub fn justifications(&self, i: usize) -> impl ExactSizeIterator<Item = Support<'_>> {
+        let k = self.atoms.len();
+        let (start, end) = if i < self.len {
+            (self.offsets[i] as usize, self.offsets[i + 1] as usize)
+        } else {
+            (0, 0)
+        };
+        (start..end).map(move |j| &self.support[j * k..(j + 1) * k])
+    }
+
+    /// True if there may be result rows that were not returned (the row cap was
+    /// reached). A first-class outcome, never an error.
+    #[must_use]
+    pub fn rows_truncated(&self) -> bool {
+        self.rows_truncated
+    }
+
+    /// True if some returned row may have justifications that were not returned
+    /// (the per-row cap was reached, or the row cap stopped evaluation).
+    #[must_use]
+    pub fn evidence_truncated(&self) -> bool {
+        self.evidence_truncated
+    }
+}
+
+/// Groups solutions into distinct rows while collecting their provenance,
+/// applying both caps as it goes.
 struct Collect {
     outputs: Vec<Code>,
-    max: usize,
-    truncated: bool,
-    out: Vec<QuerySolution>,
+    arity: usize,
+    limits: QueryLimits,
+    rows: Vec<Value>,
+    row_keys: KeyTable,
+    justifications: Vec<u32>,
+    /// Per kept justification, in solution order: its row, and its support.
+    sol_rows: Vec<u32>,
+    sol_support: Vec<u32>,
+    fact_ids: IdMap,
+    facts: Vec<FactRef>,
+    scratch: Vec<Value>,
+    rows_truncated: bool,
+    evidence_truncated: bool,
+}
+
+impl Collect {
+    fn new(outputs: Vec<Code>, limits: QueryLimits) -> Self {
+        let arity = outputs.len();
+        Collect {
+            outputs,
+            arity,
+            limits,
+            rows: Vec::new(),
+            row_keys: KeyTable::new((0..arity).collect()),
+            justifications: Vec::new(),
+            sol_rows: Vec::new(),
+            sol_support: Vec::new(),
+            fact_ids: IdMap::default(),
+            facts: Vec::new(),
+            scratch: Vec::new(),
+            rows_truncated: false,
+            evidence_truncated: false,
+        }
+    }
+
+    /// Lays the kept justifications out row by row (a stable counting sort,
+    /// so each row's justifications stay in solution order).
+    fn finish(self, atoms: Vec<String>) -> QueryOutput {
+        let k = atoms.len();
+        let len = self.justifications.len();
+        let mut offsets = Vec::with_capacity(len + 1);
+        let mut total = 0_u32;
+        offsets.push(0);
+        for &n in &self.justifications {
+            total += n;
+            offsets.push(total);
+        }
+        let mut cursor: Vec<u32> = offsets[..len].to_vec();
+        let mut support = vec![0; self.sol_support.len()];
+        for (s, &r) in self.sol_rows.iter().enumerate() {
+            let j = cursor[r as usize] as usize;
+            cursor[r as usize] += 1;
+            support[j * k..(j + 1) * k].copy_from_slice(&self.sol_support[s * k..(s + 1) * k]);
+        }
+        QueryOutput {
+            arity: self.arity,
+            len,
+            rows: self.rows,
+            atoms,
+            facts: self.facts,
+            offsets,
+            support,
+            rows_truncated: self.rows_truncated,
+            evidence_truncated: self.evidence_truncated,
+        }
+    }
 }
 
 impl Sink for Collect {
     fn stop(&self) -> bool {
-        self.truncated
+        self.rows_truncated
     }
 
     fn emit(
         &mut self,
-        db: &Database,
+        _db: &Database,
         env: &[Value],
         stack: &mut Vec<Value>,
         support: &[(usize, RowId)],
     ) -> Result<(), EvalError> {
-        if self.out.len() >= self.max {
-            self.truncated = true;
+        eval_into(&self.outputs, env, stack, &mut self.scratch)?;
+        let hash = hash_values(self.scratch.iter().copied());
+        let row = if let Some(row) = self
+            .row_keys
+            .find(&self.scratch, hash, &self.rows, self.arity)
+        {
+            row as usize
+        } else {
+            let row = self.justifications.len();
+            if row >= self.limits.max_rows {
+                self.rows_truncated = true;
+                self.evidence_truncated = true;
+                return Ok(());
+            }
+            self.rows.extend_from_slice(&self.scratch);
+            self.row_keys.insert(hash, rid(row));
+            self.justifications.push(0);
+            row
+        };
+        if self.justifications[row] as usize >= self.limits.max_justifications_per_row {
+            self.evidence_truncated = true;
             return Ok(());
         }
-        let mut tuple = Vec::with_capacity(self.outputs.len());
-        eval_into(&self.outputs, env, stack, &mut tuple)?;
-        self.out.push(QuerySolution {
-            tuple,
-            support: support_tuples(db, support),
-        });
+        self.justifications[row] += 1;
+        self.sol_rows.push(rid(row));
+        for &(rel, id) in support {
+            let fact = FactRef::new(rel, id);
+            let (fid, new) = self.fact_ids.get_or_insert(fact.key());
+            if new {
+                self.facts.push(fact);
+            }
+            self.sol_support.push(fid);
+        }
         Ok(())
     }
 }
 
 /// Evaluates an ad-hoc conjunctive query — `(outputs) <-- body` — read-only
-/// against the current materialized `db`, returning each solution with its
-/// provenance and stopping once `max` solutions have been collected.
+/// against the current materialized `db`, returning its distinct rows and their
+/// provenance under the two independent caps in `limits`.
 ///
 /// This is the queries-grain primitive. The body is a single non-recursive
 /// conjunction over already-materialized relations, so — unlike [`run`] — there
@@ -1496,9 +1707,12 @@ impl Sink for Collect {
 /// any other bound-column pattern gets a transient index for this call only.
 ///
 /// The bound is on *cardinality*, not time: such a query always terminates, so
-/// the only blast radius is space. Collection stops at `max` solutions and
-/// [`QueryOutput::truncated`] is set, so an unfiltered (cartesian-product) join
-/// is truncated rather than allowed to exhaust memory.
+/// the only blast radius is space. The output holds at most
+/// `limits.max_rows` rows with at most `limits.max_justifications_per_row`
+/// justifications each; reaching either cap sets the corresponding flag
+/// ([`QueryOutput::rows_truncated`], [`QueryOutput::evidence_truncated`]) rather
+/// than allowing an unfiltered (cartesian-product) join to exhaust memory.
+/// Reaching the row cap also stops evaluation.
 ///
 /// # Errors
 ///
@@ -1509,7 +1723,7 @@ pub fn eval_query(
     db: &Database,
     outputs: &[Expr],
     body: &[BodyClause],
-    max: usize,
+    limits: QueryLimits,
 ) -> Result<QueryOutput, EvalError> {
     let mut body = plan_body(db, body)?;
     let outputs = outputs
@@ -1518,13 +1732,16 @@ pub fn eval_query(
         .collect::<Result<Vec<_>, _>>()?;
     let mut locals = Vec::new();
     attach_transient(db, &mut body.steps, &mut locals);
+    let atoms = body
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::Positive { probe, .. } => Some(db.relations[probe.rel].name.clone()),
+            _ => None,
+        })
+        .collect();
     let windows = vec![ALL; body.steps.len()];
-    let mut sink = Collect {
-        outputs,
-        max,
-        truncated: false,
-        out: Vec::new(),
-    };
+    let mut sink = Collect::new(outputs, limits);
     let mut env = vec![Value::Int(0); body.slots];
     Walk::new(db, &locals).walk(
         &body.steps,
@@ -1534,8 +1751,5 @@ pub fn eval_query(
         &mut Vec::new(),
         &mut sink,
     )?;
-    Ok(QueryOutput {
-        solutions: sink.out,
-        truncated: sink.truncated,
-    })
+    Ok(sink.finish(atoms))
 }

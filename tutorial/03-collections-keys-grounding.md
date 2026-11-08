@@ -117,7 +117,7 @@ key-spaces:
 
 ```rust
 use ascent_jit::{Engine, Value};
-use fact_query::{Cardinality, FactStore};
+use fact_query::{FactStore, Limits};
 
 let mut engine = Engine::from_source("
     relation arg(sym, int, sym);
@@ -146,7 +146,7 @@ engine.run().unwrap();
 
 let q = engine.parse_query("(cmd, p) <-- command_creates_config(cmd, p)").unwrap();
 engine.check(&q).unwrap();
-let (results, _) = engine.eval(&q, Cardinality::new(1_000)).unwrap();
+let (results, _) = engine.eval(&q, Limits::rows(1_000)).unwrap();
 assert_eq!(results.rows().len(), 1); // the bridge let the two key-spaces meet
 ```
 

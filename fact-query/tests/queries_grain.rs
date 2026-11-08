@@ -4,7 +4,7 @@
 //! intent, so these tests assert on shape, safety, and bounds — not on meaning.
 
 use ascent_jit::{Engine, Type, Value};
-use fact_query::{Cardinality, FactStore};
+use fact_query::{FactStore, Limits};
 
 fn int(n: i64) -> Value {
     Value::Int(n)
@@ -40,7 +40,7 @@ fn parse_check_eval_with_provenance() {
     let mut engine = graph(&[(1, 2), (1, 3), (2, 3)]);
     let query = engine.parse_query("(x) <-- edge(x, _)").unwrap();
     engine.check(&query).unwrap();
-    let (results, provenance) = engine.eval(&query, Cardinality::new(100)).unwrap();
+    let (results, provenance) = engine.eval(&query, Limits::rows(100)).unwrap();
 
     let mut rows = results.rows().to_vec();
     rows.sort();
@@ -48,19 +48,35 @@ fn parse_check_eval_with_provenance() {
     assert!(!results.is_truncated());
 
     // Provenance is aligned with the rows and node 1 has two justifications
-    // (edge(1,2) and edge(1,3)).
-    assert_eq!(provenance.rows().len(), results.len());
-    let node_one = provenance
+    // (edge(1,2) and edge(1,3)); every support column is `edge`.
+    assert_eq!(provenance.len(), results.len());
+    assert!(!provenance.is_truncated());
+    assert_eq!(provenance.atoms().collect::<Vec<_>>(), ["edge"]);
+    let node_one = results
         .rows()
         .iter()
-        .find(|p| p.row == vec![int(1)])
-        .expect("provenance for row (1)");
-    assert_eq!(node_one.justifications.len(), 2);
-    assert!(node_one.justifications.iter().all(|j| {
-        j.support
-            .iter()
-            .any(|s| s.relation == "edge" && s.tuple[0] == int(1))
+        .position(|r| *r == vec![int(1)])
+        .expect("row (1)");
+    assert_eq!(provenance.justifications(node_one).len(), 2);
+    assert!(provenance.justifications(node_one).all(|j| {
+        j.support()
+            .all(|f| f.relation == "edge" && f.tuple[0] == int(1))
     }));
+    assert_eq!(provenance.facts().len(), 3, "each edge stored once");
+}
+
+/// The caps are independent: a tight per-row evidence cap keeps every row and
+/// reports only the evidence as truncated.
+#[test]
+fn evidence_cap_keeps_rows() {
+    let mut engine = graph(&[(1, 2), (1, 3), (2, 3)]);
+    let query = engine.parse_query("(x) <-- edge(x, _)").unwrap();
+    let limits = Limits::rows(100).with_justifications_per_row(1);
+    let (results, provenance) = engine.eval(&query, limits).unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(!results.is_truncated(), "all rows are present");
+    assert!(provenance.is_truncated(), "row (1) lost a justification");
+    assert!((0..results.len()).all(|r| provenance.justifications(r).len() == 1));
 }
 
 /// Guarantee 3: an output variable bound by no positive body literal is rejected
@@ -106,7 +122,7 @@ fn check_rejects_negation() {
 fn eval_is_cardinality_bounded() {
     let mut engine = graph(&[(1, 2), (1, 3), (2, 3)]);
     let query = engine.parse_query("(x, y) <-- edge(x, y)").unwrap();
-    let (results, _prov) = engine.eval(&query, Cardinality::new(2)).unwrap();
+    let (results, _prov) = engine.eval(&query, Limits::rows(2)).unwrap();
     assert_eq!(results.len(), 2);
     assert!(results.is_truncated());
 }
