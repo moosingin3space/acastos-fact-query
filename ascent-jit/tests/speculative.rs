@@ -51,7 +51,7 @@ fn speculation_detects_a_would_be_violation() {
     let mut engine = Engine::from_source(VIOLATION_SHAPE).unwrap();
     engine.add_fact("forbidden", vec![int(7)]).unwrap();
     engine.run().unwrap();
-    assert!(engine.query("violation").is_empty());
+    assert_eq!(engine.query("violation"), [] as [Vec<ascent_jit::Value>; 0]);
 
     // A candidate that trips the constraint.
     let bad = engine.speculate(&[("candidate", vec![int(7)])]).unwrap();
@@ -59,7 +59,7 @@ fn speculation_detects_a_would_be_violation() {
 
     // A candidate that does not.
     let ok = engine.speculate(&[("candidate", vec![int(5)])]).unwrap();
-    assert!(ok.added("violation").is_empty());
+    assert_eq!(ok.added("violation"), &[] as &[Vec<ascent_jit::Value>]);
 }
 
 /// A candidate that derives nothing new yields empty consequences.
