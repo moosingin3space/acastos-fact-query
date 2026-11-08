@@ -1,4 +1,4 @@
-//! Q1 — join scaling / naïve-core cost.
+//! Q1 — join scaling / relational-core cost.
 //!
 //! Transitive closure (`path(x, z) <-- edge(x, y), path(y, z)` plus the base
 //! rule) over a chain graph of `n` edges, timed at several sizes. Three engines
@@ -33,8 +33,8 @@ relation path(int, int);
 path(x, y) <-- edge(x, y);
 path(x, z) <-- edge(x, y), path(y, z);";
 
-/// The sizes to sweep: a chain of `n` edges. The naïve core is roughly O(n^3.6)
-/// here, so the top size dominates the wall-clock budget.
+/// The sizes to sweep: a chain of `n` edges. The semi-naïve core is roughly
+/// O(n^2) here, like the macro (ADR 0009; the naïve core it replaced was ~n^3.7).
 const SIZES: [i64; 4] = [8, 16, 32, 64];
 
 fn chain(n: i64) -> Vec<(i64, i64)> {

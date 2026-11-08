@@ -41,6 +41,11 @@ fn program_oracle() {
     arbtest::arbtest(fuzz::differential_program);
 }
 
+#[test]
+fn seminaive_oracle() {
+    arbtest::arbtest(fuzz::differential_seminaive);
+}
+
 // --- macro fact-fuzzing: plain Datalog (transitive closure) ----------------
 mod tc {
     use super::{BTreeSet, Engine, Value, int};
