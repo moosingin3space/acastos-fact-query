@@ -6,16 +6,15 @@
 //! [`run`] for the evaluation strategy and ADR 0009 for why it is shaped this
 //! way.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops::Range;
 
+use crate::compile::{Code, ColOp, Scope, SlotId, match_ops, match_row, negated_ops};
 use crate::expr::{Expr, ExprError};
-use crate::ir::{
-    AggFunc, Aggregate, Arg, Atom, BodyClause, HeadAtom, LatticeKind, Program, RelationDecl,
-    RelationKind, Rule,
-};
+use crate::ir::{AggFunc, Arg, Atom, BodyClause, Program, RelationDecl, RelationKind, Rule};
 use crate::stack;
-use crate::value::{Symbol, Type, Value};
+use crate::table::{BitSet, KeyTable, hash_values, row_at};
+use crate::value::{Type, Value};
 
 /// An error raised during program validation or evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,45 +88,65 @@ impl From<ExprError> for EvalError {
 /// A row's position in its relation's append-only row log.
 type RowId = usize;
 
-/// Variable bindings threaded through a body traversal.
-type Env = HashMap<Symbol, Value>;
+/// A row id as the tables store it. Rows are bounded far below `u32::MAX` by
+/// memory long before this could truncate.
+#[inline]
+fn rid(id: RowId) -> u32 {
+    u32::try_from(id).unwrap_or(u32::MAX - 1)
+}
 
-/// A hash index over a fixed set of key columns: key values → the ids of the
-/// rows carrying them. Row ids are pushed in append order, so every posting
-/// list is sorted — which is what lets a lookup be restricted to a delta window
-/// with two binary searches.
+/// A hash index over a fixed set of key columns: key → the ids of the rows
+/// carrying it. Row ids are pushed in append order, so every posting list is
+/// sorted — which is what lets a lookup be restricted to a delta window with
+/// two binary searches. Keys are not stored: the table compares against rows.
 #[derive(Debug, Clone)]
 struct Index {
-    cols: Vec<usize>,
-    map: HashMap<Vec<Value>, Vec<RowId>>,
+    table: KeyTable,
+    postings: Vec<Vec<u32>>,
 }
 
 impl Index {
-    fn build(cols: Vec<usize>, rows: &[Vec<Value>]) -> Self {
+    fn build(cols: Vec<usize>, store: &RelationStore) -> Self {
         let mut index = Index {
-            cols,
-            map: HashMap::new(),
+            table: KeyTable::new(cols),
+            postings: Vec::new(),
         };
-        for (id, row) in rows.iter().enumerate() {
-            index.add(id, row);
+        for id in 0..store.len {
+            index.add(id, &store.data, store.arity());
         }
         index
     }
 
-    fn add(&mut self, id: RowId, row: &[Value]) {
-        let key = self.cols.iter().map(|&c| row[c]).collect();
-        self.map.entry(key).or_default().push(id);
+    fn cols(&self) -> &[usize] {
+        self.table.cols()
     }
 
-    fn get(&self, key: &[Value]) -> &[RowId] {
-        self.map.get(key).map_or(&[], Vec::as_slice)
+    fn add(&mut self, id: RowId, data: &[Value], arity: usize) {
+        let row = row_at(data, arity, rid(id));
+        let hash = self.table.hash_row(row);
+        if let Some(g) = self.table.find_row(row, hash, data, arity) {
+            self.postings[g as usize].push(rid(id));
+        } else {
+            self.table.insert(hash, rid(id));
+            self.postings.push(vec![rid(id)]);
+        }
+    }
+
+    fn get(&self, key: &[Value], data: &[Value], arity: usize) -> &[u32] {
+        let hash = hash_values(key.iter().copied());
+        self.table
+            .find(key, hash, data, arity)
+            .map_or(&[], |g| self.postings[g as usize].as_slice())
     }
 }
 
 /// The stored contents of a single relation.
 ///
-/// Tuples live in an append-only row log, so "the tuples derived since point
-/// *p*" is just the row range `p..`: semi-naïve deltas are ranges, not copies.
+/// Tuples live once, in a flat append-only row log (`data`, row-major with
+/// arity stride), so "the tuples derived since point *p*" is just the row range
+/// `p..`: semi-naïve deltas are ranges, not copies. Deduplication (for a
+/// lattice: the key columns) and every index are open-addressing key tables
+/// over that log, which compare against stored rows rather than copying keys.
 /// A lattice tuple superseded by a joined value is tombstoned (its `live` bit
 /// cleared) and the joined tuple appended; every reader skips dead rows.
 #[derive(Debug, Clone)]
@@ -136,12 +155,13 @@ pub struct RelationStore {
     kind: RelationKind,
     /// The declared column types, in order. Its length is the relation's arity.
     schema: Vec<Type>,
-    rows: Vec<Vec<Value>>,
-    live: Vec<bool>,
-    /// Set relations: the live tuples, for deduplication.
-    members: HashSet<Vec<Value>>,
-    /// Lattice relations: key columns → (joined value, id of its live row).
-    lattice: HashMap<Vec<Value>, (Value, RowId)>,
+    data: Vec<Value>,
+    /// The number of rows (live or dead) in `data`.
+    len: usize,
+    live: BitSet,
+    /// Set relations: every column. Lattice relations: the key columns, each
+    /// group pointing at that key's live row.
+    keys: KeyTable,
     indexes: Vec<Index>,
     /// Rows below this mark were closed under the rules at the end of the last
     /// successful [`run`]; meaningful only while [`Database::at_fixpoint`].
@@ -150,14 +170,19 @@ pub struct RelationStore {
 
 impl RelationStore {
     fn new(decl: &RelationDecl) -> Self {
+        let arity = decl.schema.len();
+        let key_cols = match decl.kind {
+            RelationKind::Relation => (0..arity).collect(),
+            RelationKind::Lattice(_) => (0..arity.saturating_sub(1)).collect(),
+        };
         RelationStore {
             name: decl.name.clone(),
             kind: decl.kind,
             schema: decl.schema.clone(),
-            rows: Vec::new(),
-            live: Vec::new(),
-            members: HashSet::new(),
-            lattice: HashMap::new(),
+            data: Vec::new(),
+            len: 0,
+            live: BitSet::default(),
+            keys: KeyTable::new(key_cols),
             indexes: Vec::new(),
             closed: 0,
         }
@@ -168,85 +193,90 @@ impl RelationStore {
     }
 
     fn len(&self) -> usize {
-        self.rows.len()
+        self.len
+    }
+
+    /// Row `id` (live or dead).
+    #[inline]
+    fn row(&self, id: RowId) -> &[Value] {
+        row_at(&self.data, self.arity(), rid(id))
     }
 
     /// Inserts a tuple, applying lattice join for lattice relations. Returns
     /// whether the relation changed.
-    fn insert(&mut self, tuple: Vec<Value>) -> bool {
-        match self.kind {
-            RelationKind::Relation => {
-                if !self.members.insert(tuple.clone()) {
-                    return false;
-                }
-                self.push(tuple);
+    fn insert(&mut self, tuple: &[Value]) -> bool {
+        let hash = self.keys.hash_row(tuple);
+        let found = self.keys.find_row(tuple, hash, &self.data, self.arity());
+        match (self.kind, found) {
+            (RelationKind::Relation, Some(_)) => false,
+            (RelationKind::Relation | RelationKind::Lattice(_), None) => {
+                self.data.extend_from_slice(tuple);
+                let id = self.push_row();
+                self.keys.insert(hash, rid(id));
                 true
             }
-            RelationKind::Lattice(kind) => self.insert_lattice(kind, tuple),
-        }
-    }
-
-    fn insert_lattice(&mut self, kind: LatticeKind, tuple: Vec<Value>) -> bool {
-        let split = self.arity() - 1;
-        let key = tuple[..split].to_vec();
-        let new_val = tuple[split];
-        if let Some((existing, old_id)) = self.lattice.get(&key).copied() {
-            let joined = kind.join(existing, new_val);
-            if joined == existing {
-                return false;
+            (RelationKind::Lattice(kind), Some(g)) => {
+                let split = self.arity() - 1;
+                let old = self.keys.rep(g) as usize;
+                let existing = self.row(old)[split];
+                let joined = kind.join(existing, tuple[split]);
+                if joined == existing {
+                    return false;
+                }
+                self.live.clear(old);
+                self.data.extend_from_slice(&tuple[..split]);
+                self.data.push(joined);
+                let id = self.push_row();
+                self.keys.set_rep(g, rid(id));
+                true
             }
-            self.live[old_id] = false;
-            let mut row = key.clone();
-            row.push(joined);
-            let id = self.push(row);
-            self.lattice.insert(key, (joined, id));
-        } else {
-            let id = self.push(tuple);
-            self.lattice.insert(key, (new_val, id));
         }
-        true
     }
 
-    fn push(&mut self, row: Vec<Value>) -> RowId {
-        let id = self.rows.len();
+    /// Registers the row just appended to `data`, returning its id.
+    fn push_row(&mut self) -> RowId {
+        let id = self.len;
+        self.live.push_set(id);
+        self.len += 1;
+        let arity = self.arity();
         for index in &mut self.indexes {
-            index.add(id, &row);
+            index.add(id, &self.data, arity);
         }
-        self.rows.push(row);
-        self.live.push(true);
         id
     }
 
     /// Whether `tuple` is currently stored (for a lattice: with exactly this
     /// joined value).
     fn contains(&self, tuple: &[Value]) -> bool {
+        let hash = self.keys.hash_row(tuple);
+        let Some(g) = self.keys.find_row(tuple, hash, &self.data, self.arity()) else {
+            return false;
+        };
         match self.kind {
-            RelationKind::Relation => self.members.contains(tuple),
+            RelationKind::Relation => true,
             RelationKind::Lattice(_) => {
                 let split = self.arity() - 1;
-                self.lattice
-                    .get(&tuple[..split])
-                    .is_some_and(|&(v, _)| v == tuple[split])
+                self.row(self.keys.rep(g) as usize)[split] == tuple[split]
             }
         }
     }
 
-    fn live_rows(&self) -> impl Iterator<Item = &Vec<Value>> {
-        self.rows
-            .iter()
-            .zip(&self.live)
-            .filter_map(|(row, &live)| live.then_some(row))
+    fn live_rows(&self) -> impl Iterator<Item = &[Value]> {
+        (0..self.len)
+            .filter(|&id| self.live.get(id))
+            .map(|id| self.row(id))
     }
 
     fn index_of(&self, cols: &[usize]) -> Option<usize> {
-        self.indexes.iter().position(|i| i.cols == cols)
+        self.indexes.iter().position(|i| i.cols() == cols)
     }
 
     fn ensure_index(&mut self, cols: &[usize]) -> usize {
         if let Some(i) = self.index_of(cols) {
             return i;
         }
-        self.indexes.push(Index::build(cols.to_vec(), &self.rows));
+        let index = Index::build(cols.to_vec(), self);
+        self.indexes.push(index);
         self.indexes.len() - 1
     }
 }
@@ -305,6 +335,10 @@ impl Database {
     /// # Errors
     ///
     /// Returns [`EvalError`] if the relation is unknown or the arity is wrong.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "public API takes the tuple by value; storage copies it into the flat row log"
+    )]
     pub fn insert(&mut self, relation: &str, tuple: Vec<Value>) -> Result<bool, EvalError> {
         let id = self.id(relation)?;
         let store = &mut self.relations[id];
@@ -315,7 +349,7 @@ impl Database {
                 got: tuple.len(),
             });
         }
-        Ok(store.insert(tuple))
+        Ok(store.insert(&tuple))
     }
 
     /// Asserts an externally-supplied fact into `relation`, validating arity **and**
@@ -359,7 +393,7 @@ impl Database {
     #[must_use]
     pub fn tuples(&self, relation: &str) -> Vec<Vec<Value>> {
         self.store(relation)
-            .map(|s| s.live_rows().cloned().collect())
+            .map(|s| s.live_rows().map(<[Value]>::to_vec).collect())
             .unwrap_or_default()
     }
 
@@ -372,8 +406,8 @@ impl Database {
             return Vec::new();
         };
         (before.len()..fork.len())
-            .filter(|&id| fork.live[id] && !before.contains(&fork.rows[id]))
-            .map(|id| fork.rows[id].clone())
+            .filter(|&id| fork.live.get(id) && !before.contains(fork.row(id)))
+            .map(|id| fork.row(id).to_vec())
             .collect()
     }
 }
@@ -519,12 +553,12 @@ fn relation_strata(program: &Program) -> Result<HashMap<String, usize>, EvalErro
 #[derive(Debug, Clone, Copy)]
 enum KeyPart {
     Lit(Value),
-    Var(Symbol),
+    Var(SlotId),
 }
 
 /// Which index (if any) an atom probes.
 #[derive(Debug, Clone, Copy)]
-enum Slot {
+enum Access {
     /// No usable key: scan the row range.
     Scan,
     /// A persistent index owned by the relation's store.
@@ -540,34 +574,35 @@ enum Slot {
 struct Probe {
     rel: usize,
     key: Vec<(usize, KeyPart)>,
-    slot: Slot,
+    access: Access,
 }
 
 impl Probe {
-    fn new(
-        db: &Database,
-        atom: &Atom,
-        bound: &HashSet<Symbol>,
-        negated: bool,
-    ) -> Result<Self, EvalError> {
+    fn new(db: &Database, atom: &Atom, scope: &Scope, negated: bool) -> Result<Self, EvalError> {
         let rel = db.id(&atom.relation)?;
         let mut key = Vec::new();
         for (col, arg) in atom.args.iter().enumerate() {
             match arg {
                 Arg::Lit(v) => key.push((col, KeyPart::Lit(*v))),
-                Arg::Var(s) if bound.contains(s) => key.push((col, KeyPart::Var(*s))),
-                // A negated `?x` matches anything (see `any_match`), so it is
-                // only a key column in a positive atom.
-                Arg::LatticeBind(s) if !negated && bound.contains(s) => {
-                    key.push((col, KeyPart::Var(*s)));
+                // A negated `?x` matches anything, so it is only a key column
+                // in a positive atom.
+                Arg::Var(s) => {
+                    if let Some(slot) = scope.get(*s) {
+                        key.push((col, KeyPart::Var(slot)));
+                    }
                 }
-                Arg::Var(_) | Arg::LatticeBind(_) | Arg::Wildcard => {}
+                Arg::LatticeBind(s) if !negated => {
+                    if let Some(slot) = scope.get(*s) {
+                        key.push((col, KeyPart::Var(slot)));
+                    }
+                }
+                Arg::LatticeBind(_) | Arg::Wildcard => {}
             }
         }
         Ok(Probe {
             rel,
             key,
-            slot: Slot::Scan,
+            access: Access::Scan,
         })
     }
 
@@ -575,30 +610,42 @@ impl Probe {
         self.key.iter().map(|&(c, _)| c).collect()
     }
 
-    /// The key values under `env`, or `None` if a key variable is unbound (which
-    /// planning rules out; the caller then falls back to a scan).
-    fn key_values(&self, env: &Env) -> Option<Vec<Value>> {
-        self.key
-            .iter()
-            .map(|&(_, part)| match part {
-                KeyPart::Lit(v) => Some(v),
-                KeyPart::Var(s) => env.get(&s).copied(),
-            })
-            .collect()
+    /// Writes the key values under `env` into `out`.
+    fn key_into(&self, env: &[Value], out: &mut Vec<Value>) {
+        out.clear();
+        out.extend(self.key.iter().map(|&(_, part)| match part {
+            KeyPart::Lit(v) => v,
+            KeyPart::Var(slot) => env[slot],
+        }));
     }
 }
 
-/// One body clause, resolved against a database.
+/// One body clause, compiled against a database.
 #[derive(Debug)]
-enum Step<'p> {
-    Positive { atom: &'p Atom, probe: Probe },
-    Negative { atom: &'p Atom, probe: Probe },
-    Condition(&'p Expr),
-    Let { var: Symbol, expr: &'p Expr },
-    Aggregate { agg: &'p Aggregate, probe: Probe },
+enum Step {
+    Positive {
+        probe: Probe,
+        ops: Vec<ColOp>,
+    },
+    Negative {
+        probe: Probe,
+        ops: Vec<ColOp>,
+    },
+    Condition(Code),
+    Let {
+        slot: SlotId,
+        code: Code,
+    },
+    Aggregate {
+        probe: Probe,
+        ops: Vec<ColOp>,
+        func: AggFunc,
+        arg: Option<Code>,
+        output: SlotId,
+    },
 }
 
-impl Step<'_> {
+impl Step {
     fn probe_mut(&mut self) -> Option<&mut Probe> {
         match self {
             Step::Positive { probe, .. }
@@ -609,49 +656,73 @@ impl Step<'_> {
     }
 }
 
-/// Resolves a body left to right, tracking which variables are bound at each
-/// clause so every atom knows its key columns. Slots start as [`Slot::Scan`];
-/// an `attach_*` pass assigns indexes.
-fn plan_body<'p>(db: &Database, body: &'p [BodyClause]) -> Result<Vec<Step<'p>>, EvalError> {
-    let mut bound: HashSet<Symbol> = HashSet::new();
+/// A body compiled left to right: its steps, the variables bound at its end
+/// (for compiling heads or query outputs), and its environment size.
+struct Body {
+    steps: Vec<Step>,
+    scope: Scope,
+    slots: usize,
+}
+
+/// Compiles a body, tracking which variables are bound at each clause so every
+/// atom knows its key columns and every variable use resolves to a slot.
+/// Probes start as [`Access::Scan`]; an `attach_*` pass assigns indexes.
+fn plan_body(db: &Database, body: &[BodyClause]) -> Result<Body, EvalError> {
+    let mut scope = Scope::default();
+    let mut next: SlotId = 0;
     let mut steps = Vec::with_capacity(body.len());
     for clause in body {
         steps.push(match clause {
             BodyClause::Positive(atom) => {
-                let probe = Probe::new(db, atom, &bound, false)?;
-                for arg in &atom.args {
-                    if let Arg::Var(s) | Arg::LatticeBind(s) = arg {
-                        bound.insert(*s);
-                    }
-                }
-                Step::Positive { atom, probe }
+                let probe = Probe::new(db, atom, &scope, false)?;
+                let ops = match_ops(&atom.args, &mut scope, &mut next);
+                Step::Positive { probe, ops }
             }
             BodyClause::Negative(atom) => Step::Negative {
-                atom,
-                probe: Probe::new(db, atom, &bound, true)?,
+                probe: Probe::new(db, atom, &scope, true)?,
+                ops: negated_ops(&atom.args, &scope),
             },
-            BodyClause::Condition(expr) => Step::Condition(expr),
+            BodyClause::Condition(expr) => Step::Condition(Code::compile(expr, &scope)?),
             BodyClause::Let { var, expr } => {
-                bound.insert(*var);
-                Step::Let { var: *var, expr }
+                let code = Code::compile(expr, &scope)?;
+                let slot = scope.bind_fresh(*var, &mut next);
+                Step::Let { slot, code }
             }
             BodyClause::Aggregate(agg) => {
-                let probe = Probe::new(db, &agg.source, &bound, false)?;
-                bound.insert(agg.output);
-                Step::Aggregate { agg, probe }
+                let probe = Probe::new(db, &agg.source, &scope, false)?;
+                // Source-local variables are visible to the argument only.
+                let mut inner = scope.clone();
+                let ops = match_ops(&agg.source.args, &mut inner, &mut next);
+                let arg = agg
+                    .arg
+                    .as_ref()
+                    .map(|e| Code::compile(e, &inner))
+                    .transpose()?;
+                let output = scope.bind_fresh(agg.output, &mut next);
+                Step::Aggregate {
+                    probe,
+                    ops,
+                    func: agg.func,
+                    arg,
+                    output,
+                }
             }
         });
     }
-    Ok(steps)
+    Ok(Body {
+        steps,
+        scope,
+        slots: next,
+    })
 }
 
 /// Points every keyed probe at a persistent index, building any that are
 /// missing. Indexes are maintained on insert from then on.
-fn attach_persistent(db: &mut Database, steps: &mut [Step<'_>]) {
+fn attach_persistent(db: &mut Database, steps: &mut [Step]) {
     for probe in steps.iter_mut().filter_map(Step::probe_mut) {
         if !probe.key.is_empty() {
             let cols = probe.cols();
-            probe.slot = Slot::Db(db.relations[probe.rel].ensure_index(&cols));
+            probe.access = Access::Db(db.relations[probe.rel].ensure_index(&cols));
         }
     }
 }
@@ -661,23 +732,23 @@ fn attach_persistent(db: &mut Database, steps: &mut [Step<'_>]) {
 /// relation and columns). This keeps the read-only entry points
 /// ([`eval_query`], [`explain`]) literally unable to mutate the database, at
 /// the cost of one linear build per access path the program did not declare.
-fn attach_transient(db: &Database, steps: &mut [Step<'_>], locals: &mut Vec<(usize, Index)>) {
+fn attach_transient(db: &Database, steps: &mut [Step], locals: &mut Vec<(usize, Index)>) {
     for probe in steps.iter_mut().filter_map(Step::probe_mut) {
         if probe.key.is_empty() {
             continue;
         }
         let cols = probe.cols();
         let store = &db.relations[probe.rel];
-        probe.slot = if let Some(i) = store.index_of(&cols) {
-            Slot::Db(i)
+        probe.access = if let Some(i) = store.index_of(&cols) {
+            Access::Db(i)
         } else if let Some(j) = locals
             .iter()
-            .position(|(rel, ix)| *rel == probe.rel && ix.cols == cols)
+            .position(|(rel, ix)| *rel == probe.rel && ix.cols() == cols)
         {
-            Slot::Local(j)
+            Access::Local(j)
         } else {
-            locals.push((probe.rel, Index::build(cols, &store.rows)));
-            Slot::Local(locals.len() - 1)
+            locals.push((probe.rel, Index::build(cols, store)));
+            Access::Local(locals.len() - 1)
         };
     }
 }
@@ -688,13 +759,13 @@ fn attach_transient(db: &Database, steps: &mut [Step<'_>], locals: &mut Vec<(usi
 /// list, both already restricted to the visit's row window.
 enum Rows<'d> {
     Scan {
-        live: &'d [bool],
+        live: &'d BitSet,
         next: RowId,
         end: RowId,
     },
     Ids {
-        live: &'d [bool],
-        ids: std::slice::Iter<'d, RowId>,
+        live: &'d BitSet,
+        ids: std::slice::Iter<'d, u32>,
     },
 }
 
@@ -707,19 +778,23 @@ impl Iterator for Rows<'_> {
                 while *next < *end {
                     let id = *next;
                     *next += 1;
-                    if live[id] {
+                    if live.get(id) {
                         return Some(id);
                     }
                 }
                 None
             }
-            Rows::Ids { live, ids } => ids.by_ref().copied().find(|&id| live[id]),
+            Rows::Ids { live, ids } => ids.by_ref().map(|&id| id as usize).find(|&id| live.get(id)),
         }
     }
 }
 
 /// The whole relation, whatever its current length.
 const ALL: Range<RowId> = 0..RowId::MAX;
+
+/// How many body levels the walk descends between stack checks. A check costs
+/// a few nanoseconds; eight frames are far inside its red zone.
+const GUARD_EVERY: usize = 8;
 
 /// Receives each satisfying assignment of a body.
 trait Sink {
@@ -728,38 +803,55 @@ trait Sink {
         false
     }
 
-    /// Called once per satisfying assignment, with the matched positive rows.
+    /// Called once per satisfying assignment, with the environment, a scratch
+    /// stack for evaluating code, and the matched positive rows.
     fn emit(
         &mut self,
         db: &Database,
-        env: &Env,
+        env: &[Value],
+        stack: &mut Vec<Value>,
         support: &[(usize, RowId)],
     ) -> Result<(), EvalError>;
 }
 
 /// The single nested-loop join every entry point shares: [`run`] (deriving),
 /// [`explain`] (matching one target), and [`eval_query`] (collecting). Reads
-/// never mutate the database, so rows are borrowed, never cloned.
+/// never mutate the database, so rows are borrowed, never cloned, and the
+/// scratch buffers are reused across every row.
 struct Walk<'a> {
     db: &'a Database,
     locals: &'a [(usize, Index)],
+    /// Scratch for expression evaluation.
+    stack: Vec<Value>,
+    /// Scratch for building index keys.
+    key: Vec<Value>,
 }
 
 impl<'a> Walk<'a> {
-    fn rows(&self, probe: &Probe, env: &Env, window: &Range<RowId>) -> Rows<'a> {
+    fn new(db: &'a Database, locals: &'a [(usize, Index)]) -> Self {
+        Walk {
+            db,
+            locals,
+            stack: Vec::new(),
+            key: Vec::new(),
+        }
+    }
+
+    fn rows(&mut self, probe: &Probe, env: &[Value], window: &Range<RowId>) -> Rows<'a> {
         let db: &'a Database = self.db;
         let store = &db.relations[probe.rel];
         let end = window.end.min(store.len());
         let start = window.start.min(end);
-        let index = match probe.slot {
-            Slot::Scan => None,
-            Slot::Db(i) => Some(&store.indexes[i]),
-            Slot::Local(i) => Some(&self.locals[i].1),
+        let index = match probe.access {
+            Access::Scan => None,
+            Access::Db(i) => Some(&store.indexes[i]),
+            Access::Local(i) => Some(&self.locals[i].1),
         };
-        if let (Some(index), Some(key)) = (index, probe.key_values(env)) {
-            let ids = index.get(&key);
-            let lo = ids.partition_point(|&id| id < start);
-            let hi = ids.partition_point(|&id| id < end);
+        if let Some(index) = index {
+            probe.key_into(env, &mut self.key);
+            let ids = index.get(&self.key, &store.data, store.arity());
+            let lo = ids.partition_point(|&id| (id as usize) < start);
+            let hi = ids.partition_point(|&id| (id as usize) < end);
             return Rows::Ids {
                 live: &store.live,
                 ids: ids[lo..hi].iter(),
@@ -776,25 +868,29 @@ impl<'a> Walk<'a> {
     /// may read (the semi-naïve delta discipline); other steps read everything.
     ///
     /// Recursion depth is the body's clause count, which nothing bounds, so
-    /// each level runs under [`stack::guard`].
+    /// every [`GUARD_EVERY`]th level runs under [`stack::guard`].
     fn walk<S: Sink>(
         &mut self,
-        steps: &[Step<'_>],
+        steps: &[Step],
         windows: &[Range<RowId>],
         idx: usize,
-        env: &mut Env,
+        env: &mut [Value],
         support: &mut Vec<(usize, RowId)>,
         sink: &mut S,
     ) -> Result<(), EvalError> {
-        stack::guard(|| self.walk_step(steps, windows, idx, env, support, sink))
+        if idx.is_multiple_of(GUARD_EVERY) {
+            stack::guard(|| self.walk_step(steps, windows, idx, env, support, sink))
+        } else {
+            self.walk_step(steps, windows, idx, env, support, sink)
+        }
     }
 
     fn walk_step<S: Sink>(
         &mut self,
-        steps: &[Step<'_>],
+        steps: &[Step],
         windows: &[Range<RowId>],
         idx: usize,
-        env: &mut Env,
+        env: &mut [Value],
         support: &mut Vec<(usize, RowId)>,
         sink: &mut S,
     ) -> Result<(), EvalError> {
@@ -802,55 +898,58 @@ impl<'a> Walk<'a> {
             return Ok(());
         }
         let Some(step) = steps.get(idx) else {
-            return sink.emit(self.db, env, support);
+            return sink.emit(self.db, env, &mut self.stack, support);
         };
         match step {
-            Step::Positive { atom, probe } => {
+            Step::Positive { probe, ops } => {
                 let db: &'a Database = self.db;
                 let store = &db.relations[probe.rel];
                 for id in self.rows(probe, env, &windows[idx]) {
-                    let Some(bindings) = unify(&atom.args, &store.rows[id], env) else {
-                        continue;
-                    };
-                    let keys: Vec<Symbol> = bindings.iter().map(|(s, _)| *s).collect();
-                    env.extend(bindings);
-                    support.push((probe.rel, id));
-                    self.walk(steps, windows, idx + 1, env, support, sink)?;
-                    support.pop();
-                    for s in keys {
-                        env.remove(&s);
+                    if match_row(ops, store.row(id), env) {
+                        support.push((probe.rel, id));
+                        let result = self.walk(steps, windows, idx + 1, env, support, sink);
+                        support.pop();
+                        result?;
                     }
                 }
                 Ok(())
             }
-            Step::Negative { atom, probe } => {
-                let store = &self.db.relations[probe.rel];
-                let found = self
-                    .rows(probe, env, &ALL)
-                    .any(|id| neg_match(&atom.args, &store.rows[id], env));
+            Step::Negative { probe, ops } => {
+                let db: &'a Database = self.db;
+                let store = &db.relations[probe.rel];
+                let mut found = false;
+                for id in self.rows(probe, env, &ALL) {
+                    // Negated ops never write, so `env` is untouched.
+                    if match_row(ops, store.row(id), env) {
+                        found = true;
+                        break;
+                    }
+                }
                 if !found {
                     self.walk(steps, windows, idx + 1, env, support, sink)?;
                 }
                 Ok(())
             }
-            Step::Condition(expr) => {
-                if expr.eval(env)? == Value::Bool(true) {
+            Step::Condition(code) => {
+                if code.run(env, &mut self.stack)? == Value::Bool(true) {
                     self.walk(steps, windows, idx + 1, env, support, sink)?;
                 }
                 Ok(())
             }
-            Step::Let { var, expr } => {
-                let v = expr.eval(env)?;
-                env.insert(*var, v);
-                self.walk(steps, windows, idx + 1, env, support, sink)?;
-                env.remove(var);
-                Ok(())
+            Step::Let { slot, code } => {
+                env[*slot] = code.run(env, &mut self.stack)?;
+                self.walk(steps, windows, idx + 1, env, support, sink)
             }
-            Step::Aggregate { agg, probe } => {
-                if let Some(result) = self.aggregate(agg, probe, env)? {
-                    env.insert(agg.output, result);
+            Step::Aggregate {
+                probe,
+                ops,
+                func,
+                arg,
+                output,
+            } => {
+                if let Some(result) = self.aggregate(probe, ops, *func, arg.as_ref(), env)? {
+                    env[*output] = result;
                     self.walk(steps, windows, idx + 1, env, support, sink)?;
-                    env.remove(&agg.output);
                 }
                 Ok(())
             }
@@ -859,75 +958,38 @@ impl<'a> Walk<'a> {
 
     fn aggregate(
         &mut self,
-        agg: &Aggregate,
         probe: &Probe,
-        env: &Env,
+        ops: &[ColOp],
+        func: AggFunc,
+        arg: Option<&Code>,
+        env: &mut [Value],
     ) -> Result<Option<Value>, EvalError> {
         let db: &'a Database = self.db;
         let store = &db.relations[probe.rel];
-        let mut values: Vec<Value> = Vec::new();
         let mut count: i64 = 0;
+        let mut acc: Option<i64> = None;
         for id in self.rows(probe, env, &ALL) {
-            let Some(bindings) = unify(&agg.source.args, &store.rows[id], env) else {
+            if !match_row(ops, store.row(id), env) {
                 continue;
-            };
+            }
             count += 1;
-            if let Some(arg) = &agg.arg {
-                let mut local = env.clone();
-                local.extend(bindings);
-                values.push(arg.eval(&local)?);
+            if let Some(code) = arg {
+                let v = value_as_int(&code.run(env, &mut self.stack)?);
+                acc = Some(match (func, acc) {
+                    (_, None) => v,
+                    (AggFunc::Sum, Some(a)) => a.wrapping_add(v),
+                    (AggFunc::Min, Some(a)) => a.min(v),
+                    (AggFunc::Max, Some(a)) => a.max(v),
+                    (AggFunc::Count, Some(a)) => a,
+                });
             }
         }
-        let ints = || values.iter().map(value_as_int);
-        Ok(match agg.func {
+        Ok(match func {
             AggFunc::Count => Some(Value::Int(count)),
-            AggFunc::Sum => Some(Value::Int(ints().sum())),
-            AggFunc::Min => ints().min().map(Value::Int),
-            AggFunc::Max => ints().max().map(Value::Int),
+            AggFunc::Sum => Some(Value::Int(acc.unwrap_or(0))),
+            AggFunc::Min | AggFunc::Max => acc.map(Value::Int),
         })
     }
-}
-
-/// Unifies `args` against `tuple` given current `env`, returning the new
-/// bindings to apply, or `None` if they do not match.
-fn unify(args: &[Arg], tuple: &[Value], env: &Env) -> Option<Vec<(Symbol, Value)>> {
-    if args.len() != tuple.len() {
-        return None;
-    }
-    let mut new: Vec<(Symbol, Value)> = Vec::new();
-    for (arg, &val) in args.iter().zip(tuple) {
-        match arg {
-            Arg::Wildcard => {}
-            Arg::Lit(v) => {
-                if *v != val {
-                    return None;
-                }
-            }
-            Arg::Var(s) | Arg::LatticeBind(s) => {
-                let bound = env
-                    .get(s)
-                    .copied()
-                    .or_else(|| new.iter().find(|(k, _)| k == s).map(|(_, v)| *v));
-                match bound {
-                    Some(existing) if existing != val => return None,
-                    Some(_) => {}
-                    None => new.push((*s, val)),
-                }
-            }
-        }
-    }
-    Some(new)
-}
-
-/// Negation-as-failure match for one tuple: unbound variables match anything
-/// and bind nothing.
-fn neg_match(args: &[Arg], tuple: &[Value], env: &Env) -> bool {
-    args.len() == tuple.len()
-        && args.iter().zip(tuple).all(|(arg, &val)| match arg {
-            Arg::Wildcard | Arg::LatticeBind(_) => true,
-            Arg::Lit(v) => *v == val,
-            Arg::Var(s) => env.get(s).is_none_or(|&bound| bound == val),
-        })
 }
 
 fn value_as_int(v: &Value) -> i64 {
@@ -943,17 +1005,33 @@ fn support_tuples(db: &Database, support: &[(usize, RowId)]) -> Vec<(String, Vec
         .iter()
         .map(|&(rel, id)| {
             let store = &db.relations[rel];
-            (store.name.clone(), store.rows[id].clone())
+            (store.name.clone(), store.row(id).to_vec())
         })
         .collect()
 }
 
+/// Evaluates each of `codes` into `out`.
+fn eval_into(
+    codes: &[Code],
+    env: &[Value],
+    stack: &mut Vec<Value>,
+    out: &mut Vec<Value>,
+) -> Result<(), EvalError> {
+    out.clear();
+    for code in codes {
+        out.push(code.run(env, stack)?);
+    }
+    Ok(())
+}
+
 // ----- the fixed point -----------------------------------------------------
 
-/// A rule resolved for evaluation.
-struct RulePlan<'p> {
-    steps: Vec<Step<'p>>,
-    heads: Vec<(usize, &'p HeadAtom)>,
+/// A rule compiled for evaluation.
+struct RulePlan {
+    steps: Vec<Step>,
+    /// Each head's relation and compiled column expressions.
+    heads: Vec<(usize, Vec<Code>)>,
+    slots: usize,
     /// Indices into `steps` of the positive atoms (the delta candidates).
     positives: Vec<usize>,
     /// Relations read under negation or aggregation. These are not monotone
@@ -961,17 +1039,24 @@ struct RulePlan<'p> {
     guards: Vec<usize>,
 }
 
-impl<'p> RulePlan<'p> {
-    fn new(db: &Database, rule: &'p Rule) -> Result<Self, EvalError> {
-        let steps = plan_body(db, &rule.body)?;
+impl RulePlan {
+    fn new(db: &Database, rule: &Rule) -> Result<Self, EvalError> {
+        let body = plan_body(db, &rule.body)?;
         let heads = rule
             .heads
             .iter()
-            .map(|h| Ok((db.id(&h.relation)?, h)))
+            .map(|h| {
+                let codes = h
+                    .args
+                    .iter()
+                    .map(|e| Code::compile(e, &body.scope))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((db.id(&h.relation)?, codes))
+            })
             .collect::<Result<_, EvalError>>()?;
         let mut positives = Vec::new();
         let mut guards = Vec::new();
-        for (i, step) in steps.iter().enumerate() {
+        for (i, step) in body.steps.iter().enumerate() {
             match step {
                 Step::Positive { .. } => positives.push(i),
                 Step::Negative { probe, .. } | Step::Aggregate { probe, .. } => {
@@ -981,8 +1066,9 @@ impl<'p> RulePlan<'p> {
             }
         }
         Ok(RulePlan {
-            steps,
+            steps: body.steps,
             heads,
+            slots: body.slots,
             positives,
             guards,
         })
@@ -997,7 +1083,7 @@ impl<'p> RulePlan<'p> {
 }
 
 /// Plans every rule and registers the indexes they probe.
-fn plan_rules<'p>(program: &'p Program, db: &mut Database) -> Result<Vec<RulePlan<'p>>, EvalError> {
+fn plan_rules(program: &Program, db: &mut Database) -> Result<Vec<RulePlan>, EvalError> {
     let mut plans = Vec::with_capacity(program.rules.len());
     for rule in &program.rules {
         let mut plan = RulePlan::new(db, rule)?;
@@ -1007,28 +1093,36 @@ fn plan_rules<'p>(program: &'p Program, db: &mut Database) -> Result<Vec<RulePla
     Ok(plans)
 }
 
+/// Pending buffers below this size are never compacted.
+const COMPACT_MIN: usize = 1024;
+
 /// Collects a rule's head tuples. Insertion is deferred until the walk ends
-/// (the walk holds the database immutably); tuples already stored, or already
-/// pending, are dropped on the spot so buffering cannot outgrow the new facts.
+/// (the walk holds the database immutably). Tuples already stored are dropped
+/// on the spot; duplicates *within* one firing (a projection like
+/// `a(1) <-- b(x), c(y)`) are removed by sorting and deduplicating the buffer
+/// whenever it doubles, which keeps it within twice the number of distinct new
+/// tuples at amortised `O(n log n)`, deterministically.
 struct Derive<'h> {
-    heads: &'h [(usize, &'h HeadAtom)],
+    heads: &'h [(usize, Vec<Code>)],
     pending: Vec<(usize, Vec<Value>)>,
-    seen: HashSet<(usize, Vec<Value>)>,
+    compact_at: usize,
+    scratch: Vec<Value>,
 }
 
 impl<'h> Derive<'h> {
-    fn new(heads: &'h [(usize, &'h HeadAtom)]) -> Self {
+    fn new(heads: &'h [(usize, Vec<Code>)]) -> Self {
         Derive {
             heads,
             pending: Vec::new(),
-            seen: HashSet::new(),
+            compact_at: COMPACT_MIN,
+            scratch: Vec::new(),
         }
     }
 
     fn flush(self, db: &mut Database) -> bool {
         let mut changed = false;
         for (rel, tuple) in self.pending {
-            changed |= db.relations[rel].insert(tuple);
+            changed |= db.relations[rel].insert(&tuple);
         }
         changed
     }
@@ -1038,18 +1132,20 @@ impl Sink for Derive<'_> {
     fn emit(
         &mut self,
         db: &Database,
-        env: &Env,
+        env: &[Value],
+        stack: &mut Vec<Value>,
         _support: &[(usize, RowId)],
     ) -> Result<(), EvalError> {
-        for &(rel, head) in self.heads {
-            let tuple = head
-                .args
-                .iter()
-                .map(|arg| arg.eval(env))
-                .collect::<Result<Vec<_>, _>>()?;
-            if !db.relations[rel].contains(&tuple) && self.seen.insert((rel, tuple.clone())) {
-                self.pending.push((rel, tuple));
+        for (rel, codes) in self.heads {
+            eval_into(codes, env, stack, &mut self.scratch)?;
+            if !db.relations[*rel].contains(&self.scratch) {
+                self.pending.push((*rel, self.scratch.clone()));
             }
+        }
+        if self.pending.len() >= self.compact_at {
+            self.pending.sort_unstable();
+            self.pending.dedup();
+            self.compact_at = (self.pending.len() * 2).max(COMPACT_MIN);
         }
         Ok(())
     }
@@ -1064,7 +1160,9 @@ impl Sink for Derive<'_> {
 /// it to the rows that predate them, and the atoms after it to everything —
 /// so each combination of body tuples is joined exactly once. Every atom probes
 /// a hash index on the columns already bound when it is reached, rather than
-/// scanning its relation.
+/// scanning its relation. Rule bodies are compiled first: variables live in
+/// dense slots, row matching is a list of per-column operations, and
+/// expressions run as bytecode.
 ///
 /// Evaluation is also **incremental**: once a run completes, the database
 /// remembers where its fixed point ended, and the next run (after
@@ -1103,7 +1201,7 @@ const MAX_STRATUM_ITERATIONS: u32 = 1_000_000;
 
 fn run_stratum(
     group: &[usize],
-    plans: &[RulePlan<'_>],
+    plans: &[RulePlan],
     db: &mut Database,
     base: &[RowId],
     fresh: bool,
@@ -1133,7 +1231,7 @@ fn run_stratum(
 
 /// Fires one rule against the delta `lo..hi`, then inserts what it derived.
 fn fire(
-    plan: &RulePlan<'_>,
+    plan: &RulePlan,
     db: &mut Database,
     lo: &[RowId],
     hi: &[RowId],
@@ -1143,12 +1241,9 @@ fn fire(
     let full = from_scratch || plan.guards.iter().any(|&r| changed(r));
     let mut sink = Derive::new(&plan.heads);
     {
-        let mut walk = Walk {
-            db: &*db,
-            locals: &[],
-        };
+        let mut walk = Walk::new(db, &[]);
         let mut windows = vec![0..0; plan.steps.len()];
-        let mut env = Env::new();
+        let mut env = vec![Value::Int(0); plan.slots];
         let mut support = Vec::new();
         if full {
             // Everything up to `hi`: the first firing, or a negated/aggregated
@@ -1226,11 +1321,12 @@ pub struct Derivation {
 
 /// Matches each firing of one rule against a target tuple.
 struct Explain<'t> {
-    relation: &'t str,
+    relation: usize,
     target: &'t [Value],
     is_lattice: bool,
     rule: usize,
-    heads: &'t [HeadAtom],
+    heads: &'t [(usize, Vec<Code>)],
+    scratch: Vec<Value>,
     out: Vec<Derivation>,
 }
 
@@ -1238,24 +1334,22 @@ impl Sink for Explain<'_> {
     fn emit(
         &mut self,
         db: &Database,
-        env: &Env,
+        env: &[Value],
+        stack: &mut Vec<Value>,
         support: &[(usize, RowId)],
     ) -> Result<(), EvalError> {
-        for head in self.heads {
-            if head.relation != self.relation {
+        for (rel, codes) in self.heads {
+            if *rel != self.relation {
                 continue;
             }
-            let tuple = head
-                .args
-                .iter()
-                .map(|arg| arg.eval(env))
-                .collect::<Result<Vec<_>, _>>()?;
+            eval_into(codes, env, stack, &mut self.scratch)?;
+            let tuple = &self.scratch;
             let matches = if self.is_lattice {
                 tuple.len() == self.target.len()
                     && !tuple.is_empty()
                     && tuple[..tuple.len() - 1] == self.target[..self.target.len() - 1]
             } else {
-                tuple == self.target
+                *tuple == self.target
             };
             if matches {
                 self.out.push(Derivation {
@@ -1295,32 +1389,31 @@ pub fn explain(
             .kind,
         RelationKind::Lattice(_)
     );
+    let target_rel = db.id(relation)?;
     let mut out = Vec::new();
     let mut locals = Vec::new();
     for (rule_idx, rule) in program.rules.iter().enumerate() {
         if !rule.heads.iter().any(|h| h.relation == relation) {
             continue;
         }
-        let mut steps = plan_body(db, &rule.body)?;
-        attach_transient(db, &mut steps, &mut locals);
-        let windows = vec![ALL; steps.len()];
+        let mut plan = RulePlan::new(db, rule)?;
+        attach_transient(db, &mut plan.steps, &mut locals);
+        let windows = vec![ALL; plan.steps.len()];
         let mut sink = Explain {
-            relation,
+            relation: target_rel,
             target: tuple,
             is_lattice,
             rule: rule_idx,
-            heads: &rule.heads,
+            heads: &plan.heads,
+            scratch: Vec::new(),
             out: Vec::new(),
         };
-        Walk {
-            db,
-            locals: &locals,
-        }
-        .walk(
-            &steps,
+        let mut env = vec![Value::Int(0); plan.slots];
+        Walk::new(db, &locals).walk(
+            &plan.steps,
             &windows,
             0,
-            &mut Env::new(),
+            &mut env,
             &mut Vec::new(),
             &mut sink,
         )?;
@@ -1357,14 +1450,14 @@ pub struct QueryOutput {
 }
 
 /// Collects every solution, up to the cardinality cap.
-struct Collect<'o> {
-    outputs: &'o [Expr],
+struct Collect {
+    outputs: Vec<Code>,
     max: usize,
     truncated: bool,
     out: Vec<QuerySolution>,
 }
 
-impl Sink for Collect<'_> {
+impl Sink for Collect {
     fn stop(&self) -> bool {
         self.truncated
     }
@@ -1372,18 +1465,16 @@ impl Sink for Collect<'_> {
     fn emit(
         &mut self,
         db: &Database,
-        env: &Env,
+        env: &[Value],
+        stack: &mut Vec<Value>,
         support: &[(usize, RowId)],
     ) -> Result<(), EvalError> {
         if self.out.len() >= self.max {
             self.truncated = true;
             return Ok(());
         }
-        let tuple = self
-            .outputs
-            .iter()
-            .map(|expr| expr.eval(env))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut tuple = Vec::with_capacity(self.outputs.len());
+        eval_into(&self.outputs, env, stack, &mut tuple)?;
         self.out.push(QuerySolution {
             tuple,
             support: support_tuples(db, support),
@@ -1420,25 +1511,26 @@ pub fn eval_query(
     body: &[BodyClause],
     max: usize,
 ) -> Result<QueryOutput, EvalError> {
-    let mut steps = plan_body(db, body)?;
+    let mut body = plan_body(db, body)?;
+    let outputs = outputs
+        .iter()
+        .map(|e| Code::compile(e, &body.scope))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut locals = Vec::new();
-    attach_transient(db, &mut steps, &mut locals);
-    let windows = vec![ALL; steps.len()];
+    attach_transient(db, &mut body.steps, &mut locals);
+    let windows = vec![ALL; body.steps.len()];
     let mut sink = Collect {
         outputs,
         max,
         truncated: false,
         out: Vec::new(),
     };
-    Walk {
-        db,
-        locals: &locals,
-    }
-    .walk(
-        &steps,
+    let mut env = vec![Value::Int(0); body.slots];
+    Walk::new(db, &locals).walk(
+        &body.steps,
         &windows,
         0,
-        &mut Env::new(),
+        &mut env,
         &mut Vec::new(),
         &mut sink,
     )?;

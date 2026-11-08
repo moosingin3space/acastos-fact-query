@@ -8,8 +8,10 @@ before any design change.
 
 - **`ascent-jit`** — a runtime interpreter for Ascent programs supplied as data:
   a stratified, semi-naïve, indexed, incremental fixed-point loop over a
-  relational IR ([docs/0009](docs/0009-semi-naive-indexed-evaluation.md)), with
-  `if`/`let`/head expressions evaluated by a pure tree-walk (`Expr::eval`). There
+  relational IR ([docs/0009](docs/0009-semi-naive-indexed-evaluation.md)).
+  Rule bodies compile to slot-based match ops and expression bytecode over flat
+  relation storage ([docs/0012](docs/0012-compiled-bodies-and-flat-storage.md));
+  the tree-walking `Expr::eval` is the public API and the bytecode's oracle. There
   is no WebAssembly tier any more (the name is historical; see
   [docs/0010](docs/0010-retire-the-wasm-expression-tier.md)), so the crate
   builds for `wasm32` as-is. Provides query, provenance (`explain`), and
